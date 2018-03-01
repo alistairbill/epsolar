@@ -1,3 +1,5 @@
 .pioenvs
 .piolibdeps
 src/credentials.h
+.clang_complete
+.gcc-flags.json
