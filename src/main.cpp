@@ -13,11 +13,12 @@
 const long interval = 120000;
 const long timeUpdateInterval = 3600000;
 
-unsigned int solarVoltage, solarCurrent, loadVoltage,
+uint16_t solarVoltage, solarCurrent, loadVoltage,
   loadCurrent, batteryPercent, batteryVoltage, status, day, monthYear;
-int batteryTemp, deviceTemp;
-unsigned long solarPower, loadPower, batteryCurrent;
-unsigned long previousMillis = 0;
+int16_t batteryTemp, deviceTemp;
+uint32_t solarPower, loadPower;
+int32_t batteryCurrent;
+unsigned int previousMillis = 0;
 uint8_t result;
 char buf[10];
 String timeon, timeoff;
@@ -243,9 +244,9 @@ void loop()
   if (currentMillis - previousMillis >= interval) {
     if (currentMillis - previousMillis >= timeUpdateInterval) {
       update_rtc();
-      publish_times();
     }
     previousMillis = currentMillis;
     publish_values();
+    publish_times();
   }
 }
