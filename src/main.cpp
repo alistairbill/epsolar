@@ -10,8 +10,8 @@
 
 #define EPSOLAR_DEVICE_ID 1
 
-const long interval = 120000;
-const long timeUpdateInterval = 3600000;
+const long interval = 120 * 1000;
+const long timeUpdateInterval = 60 * 60 * 1000;
 
 uint16_t solarVoltage, solarCurrent, loadVoltage,
   loadCurrent, batteryPercent, batteryVoltage, status, day, monthYear;
@@ -27,7 +27,7 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 ModbusMaster node;
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
+NTPClient timeClient(ntpUDP, "uk.pool.ntp.org");
 
 void reconnect()
 {
