@@ -44,7 +44,7 @@ void reconnect()
 
 void update_rtc()
 {
-  result = node.readInputRegisters(0x9014, 2);
+  result = node.readHoldingRegisters(0x9014, 2);
   if (result == node.ku8MBSuccess) {
     day = (node.getResponseBuffer(0x00) >> 8);
     monthYear = node.getResponseBuffer(0x01);
@@ -92,28 +92,31 @@ void update_load(bool on)
 
 void publish_times()
 {
-  result = node.readInputRegisters(0x9042, 6);
+  result = node.readHoldingRegisters(0x9042, 6);
   if (result == node.ku8MBSuccess) {
-    sprintf(buf, "%02d", node.getResponseBuffer(0x00));
+    timeon, timeoff = "";
+    timeon.reserve(9);
+    timeoff.reserve(9);
+    sprintf(buf, "%02d", node.getResponseBuffer(0x02));
     timeon += buf;
     timeon += ":";
     sprintf(buf, "%02d", node.getResponseBuffer(0x01));
     timeon += buf;
     timeon += ":";
-    sprintf(buf, "%02d", node.getResponseBuffer(0x02));
+    sprintf(buf, "%02d", node.getResponseBuffer(0x00));
     timeon += buf;
-    timeon.toCharArray(buf, 10);
+    timeon.toCharArray(buf, 9);
     client.publish("pond/time/on", buf);
 
-    sprintf(buf, "%02d", node.getResponseBuffer(0x03));
+    sprintf(buf, "%02d", node.getResponseBuffer(0x05));
     timeoff += buf;
     timeoff += ":";
     sprintf(buf, "%02d", node.getResponseBuffer(0x04));
     timeoff += buf;
     timeoff += ":";
-    sprintf(buf, "%02d", node.getResponseBuffer(0x05));
+    sprintf(buf, "%02d", node.getResponseBuffer(0x03));
     timeoff += buf;
-    timeoff.toCharArray(buf, 10);
+    timeoff.toCharArray(buf, 9);
     client.publish("pond/time/off", buf);
   }
 }
