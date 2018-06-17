@@ -13,8 +13,8 @@ int32_t batteryCurrent;
 uint8_t result;
 String timeon, timeoff;
 
-const int STATS_INTERVAL = 120;
-const int TIMER_INTERVAL = 60 * 60 * 1000;
+const int DEFAULT_STATS_INTERVAL = 120;
+const int DEFAULT_TIMER_INTERVAL = 60 * 60;
 
 unsigned long lastStatsSent = 0;
 unsigned long lastTimerSent = 0;
@@ -36,6 +36,9 @@ HomieNode solarPowerNode("solar-power", "power");
 HomieNode solarVoltageNode("solar-voltage", "voltage");
 HomieNode timerNode("timer", "time");
 
+HomieSetting<long> statsIntervalSetting("statsInterval", "The stats interval in seconds");
+HomieSetting<long> timerIntervalSetting("timerInterval", "The timer interval in seconds");
+
 void setupHandler()
 {
   batteryCurrentNode.setProperty("unit").send("A");
@@ -53,7 +56,6 @@ void setupHandler()
   solarPowerNode.setProperty("unit").send("W");
   solarVoltageNode.setProperty("unit").send("V");
 }
-
 
 bool timerOnHandler(const HomieRange& range, const String& value)
 {
@@ -194,11 +196,11 @@ void publish_stats()
 
 void loopHandler()
 {
-  if (millis() - lastStatsSent >= STATS_INTERVAL * 1000UL || lastStatsSent == 0) {
+  if (millis() - lastStatsSent >= statsIntervalSetting.get() * 1000UL || lastStatsSent == 0) {
     publish_stats();
     lastStatsSent = millis();
   }
-  if (millis() - lastTimerSent >= TIMER_INTERVAL * 1000UL || lastTimerSent == 0) {
+  if (millis() - lastTimerSent >= timerIntervalSetting.get() * 1000UL || lastTimerSent == 0) {
     publish_timer();
     lastTimerSent = millis();
   }
@@ -250,9 +252,16 @@ void setup()
 
   loadStatusNode.advertise("on").settable(loadStatusHandler);
 
+  statsIntervalSetting.setDefaultValue(DEFAULT_STATS_INTERVAL).setValidator([] (long candidate) {
+    return candidate > 0;
+  });
+
+  timerIntervalSetting.setDefaultValue(DEFAULT_TIMER_INTERVAL).setValidator([] (long candidate) {
+    return candidate > 0;
+  });
+
   Homie.setup();
 }
-
 
 void loop()
 {
