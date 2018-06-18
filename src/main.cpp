@@ -124,14 +124,14 @@ void publish_timer()
     timeon += modbus.getResponseBuffer(0x00);
     timerNode.setProperty("on").send(timeon);
 
-    if(modbus.getResponseBuffer(0x05) < 10) timeon += "0";
-    timeon += modbus.getResponseBuffer(0x05);
-    timeon += ":";
-    if(modbus.getResponseBuffer(0x04) < 10) timeon += "0";
-    timeon += modbus.getResponseBuffer(0x04);
-    timeon += ":";
-    if(modbus.getResponseBuffer(0x03) < 10) timeon += "0";
-    timeon += modbus.getResponseBuffer(0x03);
+    if(modbus.getResponseBuffer(0x05) < 10) timeoff += "0";
+    timeoff += modbus.getResponseBuffer(0x05);
+    timeoff += ":";
+    if(modbus.getResponseBuffer(0x04) < 10) timeoff += "0";
+    timeoff += modbus.getResponseBuffer(0x04);
+    timeoff += ":";
+    if(modbus.getResponseBuffer(0x03) < 10) timeoff += "0";
+    timeoff += modbus.getResponseBuffer(0x03);
     timerNode.setProperty("off").send(timeoff);
   }
 }
@@ -217,7 +217,7 @@ void setup()
   delay(10);
   modbus.begin(EPSOLAR_DEVICE_ID, Serial);
 
-  Homie_setFirmware("epsolar", "1.0.0");
+  Homie_setFirmware("epsolar", "1.0.1");
   Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
 
   batteryCurrentNode.advertise("current");
