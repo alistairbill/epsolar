@@ -59,21 +59,25 @@ void setupHandler()
 
 bool timerOnHandler(const HomieRange& range, const String& value)
 {
+  modbus.clearTransmitBuffer();
   modbus.setTransmitBuffer(0, value.substring(6, 8).toInt());
   modbus.setTransmitBuffer(1, value.substring(3, 5).toInt());
   modbus.setTransmitBuffer(2, value.substring(0, 2).toInt());
 
   result = modbus.writeMultipleRegisters(0x9042, 3);
+  timerNode.setProperty("on").send(value);
   return (result == modbus.ku8MBSuccess);
 }
 
 bool timerOffHandler(const HomieRange& range, const String& value)
 {
+  modbus.clearTransmitBuffer();
   modbus.setTransmitBuffer(0, value.substring(6, 8).toInt());
   modbus.setTransmitBuffer(1, value.substring(3, 5).toInt());
   modbus.setTransmitBuffer(2, value.substring(0, 2).toInt());
 
   result = modbus.writeMultipleRegisters(0x9045, 3);
+  timerNode.setProperty("off").send(value);
   return (result == modbus.ku8MBSuccess);
 }
 
@@ -217,7 +221,7 @@ void setup()
   delay(10);
   modbus.begin(EPSOLAR_DEVICE_ID, Serial);
 
-  Homie_setFirmware("epsolar", "1.0.1");
+  Homie_setFirmware("epsolar", "1.0.2");
   Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
 
   batteryCurrentNode.advertise("current");
