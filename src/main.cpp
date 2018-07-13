@@ -3,8 +3,7 @@
 
 #define EPSOLAR_DEVICE_ID 1
 
-uint16_t
-batteryPercent, batteryVoltage, batteryStatus,
+uint16_t batteryPercent, batteryVoltage, batteryStatus,
   loadCurrent, loadStatus, loadVoltage,
   solarVoltage, solarCurrent;
 int16_t batteryTemp, deviceTemp;
@@ -43,10 +42,10 @@ void setupHandler()
 {
   batteryCurrentNode.setProperty("unit").send("A");
   batteryLevelNode.setProperty("unit").send("%");
-  batteryTempNode.setProperty("unit").send("c");
+  batteryTempNode.setProperty("unit").send("°C");
   batteryVoltageNode.setProperty("unit").send("V");
 
-  deviceTempNode.setProperty("unit").send("c");
+  deviceTempNode.setProperty("unit").send("°C");
 
   loadCurrentNode.setProperty("unit").send("A");
   loadPowerNode.setProperty("unit").send("W");
@@ -109,10 +108,10 @@ bool loadStatusHandler(const HomieRange& range, const String& value)
     result = modbus.writeMultipleRegisters(0x903D, 1);
     loadStatusNode.setProperty("on").send(value);
   }
-  return true;
+  return (result == modbus.ku8MBSuccess);
 }
 
-void publish_timer()
+void publishTimer()
 {
   result = modbus.readHoldingRegisters(0x9042, 6);
   if (result == modbus.ku8MBSuccess) {
@@ -140,7 +139,7 @@ void publish_timer()
   }
 }
 
-void publish_stats()
+void publishStats()
 {
   result = modbus.readInputRegisters(0x3100, 18);
   if (result == modbus.ku8MBSuccess) {
@@ -189,10 +188,17 @@ void publish_stats()
 
   result = modbus.readInputRegisters(0x3201, 2);
   if (result == modbus.ku8MBSuccess) {
-    batteryStatus = ((modbus.getResponseBuffer(0x00) & 0x0B) >> 2);
+    // Charging equipment status (0x3201)
+    // bit 0: running (1) / standby (0)
+    // bit 1: fault (1) / normal (0)
+    // bit 2/3: no charging (0) / float (1) / boost (2) / equalization (3)
+    batteryStatus = ((modbus.getResponseBuffer(0x00) & 0b1100) >> 2);
     batteryStatusNode.setProperty("status").send(String(batteryStatus));
 
-    loadStatus = (modbus.getResponseBuffer(0x01) & 0x01);
+    // Discharging equipment status (0x3202)
+    // bit 0: running (1) / standby (0)
+    // bit 1: fault (1) / normal (0)
+    loadStatus = (modbus.getResponseBuffer(0x01) & 0b1);
     loadStatusNode.setProperty("on").send((loadStatus == 1) ? "true" : "false");
   }
   modbus.clearResponseBuffer();
@@ -201,11 +207,11 @@ void publish_stats()
 void loopHandler()
 {
   if (millis() - lastStatsSent >= statsIntervalSetting.get() * 1000UL || lastStatsSent == 0) {
-    publish_stats();
+    publishStats();
     lastStatsSent = millis();
   }
   if (millis() - lastTimerSent >= timerIntervalSetting.get() * 1000UL || lastTimerSent == 0) {
-    publish_timer();
+    publishTimer();
     lastTimerSent = millis();
   }
 }
@@ -221,7 +227,7 @@ void setup()
   delay(10);
   modbus.begin(EPSOLAR_DEVICE_ID, Serial);
 
-  Homie_setFirmware("epsolar", "1.0.2");
+  Homie_setFirmware("epsolar", "1.0.3");
   Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
 
   batteryCurrentNode.advertise("current");
