@@ -4,47 +4,47 @@
 #define EPSOLAR_DEVICE_ID 1
 
 uint16_t batteryPercent, batteryVoltage, batteryStatus,
-  loadCurrent, loadStatus, loadVoltage,
+  loadCurrent, loadVoltage,
   solarVoltage, solarCurrent;
-int16_t batteryTemp, deviceTemp;
+int16_t airTemp, deviceTemp;
 uint32_t solarPower, loadPower;
 int32_t batteryCurrent;
 uint8_t result;
-String timeon, timeoff;
+int rtcTime[5];
 
 const int DEFAULT_STATS_INTERVAL = 120;
-const int DEFAULT_TIMER_INTERVAL = 60 * 60;
 
 unsigned long lastStatsSent = 0;
-unsigned long lastTimerSent = 0;
 
 ModbusMaster modbus;
 
 HomieNode batteryCurrentNode("battery-current", "current");
 HomieNode batteryLevelNode("battery-level", "fraction");
 HomieNode batteryStatusNode("battery-status", "status");
-HomieNode batteryTempNode("battery-temperature", "temperature");
 HomieNode batteryVoltageNode("battery-voltage", "voltage");
+
+HomieNode airTempNode("air-temperature", "temperature");
 HomieNode deviceTempNode("device-temperature", "temperature");
+
 HomieNode loadCurrentNode("load-current", "current");
 HomieNode loadPowerNode("load-power", "power");
 HomieNode loadVoltageNode("load-voltage", "voltage");
-HomieNode loadStatusNode("load-status", "switch");
+
 HomieNode solarCurrentNode("solar-current", "current");
 HomieNode solarPowerNode("solar-power", "power");
 HomieNode solarVoltageNode("solar-voltage", "voltage");
-HomieNode timerNode("timer", "time");
+
+HomieNode rtcNode("rtc", "time");
 
 HomieSetting<long> statsIntervalSetting("statsInterval", "The stats interval in seconds");
-HomieSetting<long> timerIntervalSetting("timerInterval", "The timer interval in seconds");
 
 void setupHandler()
 {
   batteryCurrentNode.setProperty("unit").send("A");
   batteryLevelNode.setProperty("unit").send("%");
-  batteryTempNode.setProperty("unit").send("°C");
   batteryVoltageNode.setProperty("unit").send("V");
 
+  airTempNode.setProperty("unit").send("°C");
   deviceTempNode.setProperty("unit").send("°C");
 
   loadCurrentNode.setProperty("unit").send("A");
@@ -54,89 +54,6 @@ void setupHandler()
   solarCurrentNode.setProperty("unit").send("A");
   solarPowerNode.setProperty("unit").send("W");
   solarVoltageNode.setProperty("unit").send("V");
-}
-
-bool timerOnHandler(const HomieRange& range, const String& value)
-{
-  modbus.clearTransmitBuffer();
-  modbus.setTransmitBuffer(0, value.substring(6, 8).toInt());
-  modbus.setTransmitBuffer(1, value.substring(3, 5).toInt());
-  modbus.setTransmitBuffer(2, value.substring(0, 2).toInt());
-
-  result = modbus.writeMultipleRegisters(0x9042, 3);
-  timerNode.setProperty("on").send(value);
-  return (result == modbus.ku8MBSuccess);
-}
-
-bool timerOffHandler(const HomieRange& range, const String& value)
-{
-  modbus.clearTransmitBuffer();
-  modbus.setTransmitBuffer(0, value.substring(6, 8).toInt());
-  modbus.setTransmitBuffer(1, value.substring(3, 5).toInt());
-  modbus.setTransmitBuffer(2, value.substring(0, 2).toInt());
-
-  result = modbus.writeMultipleRegisters(0x9045, 3);
-  timerNode.setProperty("off").send(value);
-  return (result == modbus.ku8MBSuccess);
-}
-
-bool loadStatusHandler(const HomieRange& range, const String& value)
-{
-  if (value != "true" && value != "false") return false;
-  bool on = (value == "true");
-
-  if (on) {
-    // set manual mode
-    modbus.clearTransmitBuffer();
-    modbus.setTransmitBuffer(0, 0);
-    result = modbus.writeMultipleRegisters(0x903D, 1);
-    // set default off
-    modbus.clearTransmitBuffer();
-    modbus.setTransmitBuffer(0, 0);
-    result = modbus.writeMultipleRegisters(0x906A, 1);
-    // set load on
-    result = modbus.writeSingleCoil(0x0002, 1);
-    loadStatusNode.setProperty("on").send(value);
-
-  } else {
-    // set load off
-    result = modbus.writeSingleCoil(0x0002, 0);
-
-    // set automatic mode
-    modbus.clearTransmitBuffer();
-    modbus.setTransmitBuffer(0, 3);
-    result = modbus.writeMultipleRegisters(0x903D, 1);
-    loadStatusNode.setProperty("on").send(value);
-  }
-  return (result == modbus.ku8MBSuccess);
-}
-
-void publishTimer()
-{
-  result = modbus.readHoldingRegisters(0x9042, 6);
-  if (result == modbus.ku8MBSuccess) {
-    timeon = "";
-    timeoff = "";
-    if(modbus.getResponseBuffer(0x02) < 10) timeon += "0";
-    timeon += modbus.getResponseBuffer(0x02);
-    timeon += ":";
-    if(modbus.getResponseBuffer(0x01) < 10) timeon += "0";
-    timeon += modbus.getResponseBuffer(0x01);
-    timeon += ":";
-    if(modbus.getResponseBuffer(0x00) < 10) timeon += "0";
-    timeon += modbus.getResponseBuffer(0x00);
-    timerNode.setProperty("on").send(timeon);
-
-    if(modbus.getResponseBuffer(0x05) < 10) timeoff += "0";
-    timeoff += modbus.getResponseBuffer(0x05);
-    timeoff += ":";
-    if(modbus.getResponseBuffer(0x04) < 10) timeoff += "0";
-    timeoff += modbus.getResponseBuffer(0x04);
-    timeoff += ":";
-    if(modbus.getResponseBuffer(0x03) < 10) timeoff += "0";
-    timeoff += modbus.getResponseBuffer(0x03);
-    timerNode.setProperty("off").send(timeoff);
-  }
 }
 
 void publishStats()
@@ -161,8 +78,8 @@ void publishStats()
     loadPower = modbus.getResponseBuffer(0x0E) + (modbus.getResponseBuffer(0x0F) << 16);
     loadPowerNode.setProperty("power").send(String(loadPower));
 
-    batteryTemp = modbus.getResponseBuffer(0x10);
-    batteryTempNode.setProperty("temperature").send(String(batteryTemp));
+    airTemp = modbus.getResponseBuffer(0x10);
+    airTempNode.setProperty("temperature").send(String(airTemp));
 
     deviceTemp = modbus.getResponseBuffer(0x11);
     deviceTempNode.setProperty("temperature").send(String(deviceTemp));
@@ -194,14 +111,31 @@ void publishStats()
     // bit 2/3: no charging (0) / float (1) / boost (2) / equalization (3)
     batteryStatus = ((modbus.getResponseBuffer(0x00) & 0b1100) >> 2);
     batteryStatusNode.setProperty("status").send(String(batteryStatus));
-
-    // Discharging equipment status (0x3202)
-    // bit 0: running (1) / standby (0)
-    // bit 1: fault (1) / normal (0)
-    loadStatus = (modbus.getResponseBuffer(0x01) & 0b1);
-    loadStatusNode.setProperty("on").send((loadStatus == 1) ? "true" : "false");
   }
   modbus.clearResponseBuffer();
+}
+
+bool rtcHandler(const HomieRange& range, const String& time) {
+    // time: hh:mm:ss
+    // rtcTime[0] seconds
+    // rtcTime[1] minutes
+    // rtcTime[2] hours
+    // rtcTime[3] day
+    // rtcTime[4] month/year
+    result = modbus.readHoldingRegisters(0x9014, 2);
+    if (result == modbus.ku8MBSuccess) {
+        rtcTime[3] = (modbus.getResponseBuffer(0x00) >> 8);
+        rtcTime[4] = modbus.getResponseBuffer(0x01);
+    }
+    rtcTime[2] = time.substring(0, 2).toInt();
+    rtcTime[1] = time.substring(3, 5).toInt();
+    rtcTime[0] = time.substring(6, 8).toInt();
+    modbus.setTransmitBuffer(0, rtcTime[0] + (rtcTime[1] << 8));
+    modbus.setTransmitBuffer(1, rtcTime[2] + (rtcTime[3] << 8));
+    modbus.setTransmitBuffer(2, rtcTime[4]);
+    result = modbus.writeMultipleRegisters(0x9013, 3);
+    rtcNode.setProperty("time").send(time);
+    return (result == modbus.ku8MBSuccess);
 }
 
 void loopHandler()
@@ -210,24 +144,17 @@ void loopHandler()
     publishStats();
     lastStatsSent = millis();
   }
-  if (millis() - lastTimerSent >= timerIntervalSetting.get() * 1000UL || lastTimerSent == 0) {
-    publishTimer();
-    lastTimerSent = millis();
-  }
 }
 
 void setup()
 {
-  timeon.reserve(9);
-  timeoff.reserve(9);
-
   Homie.disableLogging();
 
   Serial.begin(115200);
   delay(10);
   modbus.begin(EPSOLAR_DEVICE_ID, Serial);
 
-  Homie_setFirmware("epsolar", "1.0.3");
+  Homie_setFirmware("epsolar-controller", "1.0.4");
   Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
 
   batteryCurrentNode.advertise("current");
@@ -235,8 +162,8 @@ void setup()
   batteryLevelNode.advertise("level");
   batteryLevelNode.advertise("unit");
   batteryStatusNode.advertise("status");
-  batteryTempNode.advertise("temperature");
-  batteryTempNode.advertise("unit");
+  airTempNode.advertise("temperature");
+  airTempNode.advertise("unit");
   batteryVoltageNode.advertise("voltage");
   batteryVoltageNode.advertise("unit");
 
@@ -257,16 +184,9 @@ void setup()
   solarVoltageNode.advertise("voltage");
   solarVoltageNode.advertise("unit");
 
-  timerNode.advertise("on").settable(timerOnHandler);
-  timerNode.advertise("off").settable(timerOffHandler);
-
-  loadStatusNode.advertise("on").settable(loadStatusHandler);
+  rtcNode.advertise("time").settable(rtcHandler);
 
   statsIntervalSetting.setDefaultValue(DEFAULT_STATS_INTERVAL).setValidator([] (long candidate) {
-    return candidate > 0;
-  });
-
-  timerIntervalSetting.setDefaultValue(DEFAULT_TIMER_INTERVAL).setValidator([] (long candidate) {
     return candidate > 0;
   });
 
