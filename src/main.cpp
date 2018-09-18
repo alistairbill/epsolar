@@ -1,265 +1,199 @@
-#include <ArduinoOTA.h>
-#include <ESP8266mDNS.h>
-#include <ESP8266WiFi.h>
+#include <Homie.h>
 #include <ModbusMaster.h>
-#include <NTPClient.h>
-#include <PubSubClient.h>
-#include <WiFiUdp.h>
-
-#include <credentials.h>
 
 #define EPSOLAR_DEVICE_ID 1
 
-const long interval = 120 * 1000;
-const long rtcInterval = 60 * 60 * 1000;
-
-uint16_t solarVoltage, solarCurrent, loadVoltage,
-  loadCurrent, batteryPercent, batteryVoltage, batteryStatus,
-  loadStatus, day, monthYear;
-int16_t batteryTemp, deviceTemp;
+uint16_t batteryPercent, batteryVoltage, batteryStatus,
+  loadCurrent, loadVoltage,
+  solarVoltage, solarCurrent;
+int16_t airTemp, deviceTemp;
 uint32_t solarPower, loadPower;
 int32_t batteryCurrent;
-unsigned int previousMillis = 0;
 uint8_t result;
-char buf[10];
-String timeon, timeoff, msg;
+int rtcTime[5];
 
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
-ModbusMaster node;
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "uk.pool.ntp.org");
+const int DEFAULT_STATS_INTERVAL = 120;
 
-void reconnect_mqtt()
+unsigned long lastStatsSent = 0;
+
+ModbusMaster modbus;
+
+HomieNode batteryCurrentNode("battery-current", "current");
+HomieNode batteryLevelNode("battery-level", "fraction");
+HomieNode batteryStatusNode("battery-status", "status");
+HomieNode batteryVoltageNode("battery-voltage", "voltage");
+
+HomieNode airTempNode("air-temperature", "temperature");
+HomieNode deviceTempNode("device-temperature", "temperature");
+
+HomieNode loadCurrentNode("load-current", "current");
+HomieNode loadPowerNode("load-power", "power");
+HomieNode loadVoltageNode("load-voltage", "voltage");
+
+HomieNode solarCurrentNode("solar-current", "current");
+HomieNode solarPowerNode("solar-power", "power");
+HomieNode solarVoltageNode("solar-voltage", "voltage");
+
+HomieNode rtcNode("rtc", "time");
+
+HomieSetting<long> statsIntervalSetting("statsInterval", "The stats interval in seconds");
+
+void setupHandler()
 {
-  while (!mqttClient.connected()) {
-    if(mqttClient.connect("ESP8266Client")) {
-      mqttClient.subscribe("pond/load/status");
-      mqttClient.subscribe("pond/set_time/on");
-      mqttClient.subscribe("pond/set_time/off");
-    } else {
-      delay(5000);
+  batteryCurrentNode.setProperty("unit").send("A");
+  batteryLevelNode.setProperty("unit").send("%");
+  batteryVoltageNode.setProperty("unit").send("V");
+
+  airTempNode.setProperty("unit").send("°C");
+  deviceTempNode.setProperty("unit").send("°C");
+
+  loadCurrentNode.setProperty("unit").send("A");
+  loadPowerNode.setProperty("unit").send("W");
+  loadVoltageNode.setProperty("unit").send("V");
+
+  solarCurrentNode.setProperty("unit").send("A");
+  solarPowerNode.setProperty("unit").send("W");
+  solarVoltageNode.setProperty("unit").send("V");
+}
+
+void publishStats()
+{
+  result = modbus.readInputRegisters(0x3100, 18);
+  if (result == modbus.ku8MBSuccess) {
+    solarVoltage = modbus.getResponseBuffer(0x00);
+    solarVoltageNode.setProperty("voltage").send(String(solarVoltage));
+
+    solarCurrent = modbus.getResponseBuffer(0x01);
+    solarCurrentNode.setProperty("current").send(String(solarCurrent));
+
+    solarPower = modbus.getResponseBuffer(0x02) + (modbus.getResponseBuffer(0x03) << 16);
+    solarPowerNode.setProperty("power").send(String(solarPower));
+
+    loadVoltage = modbus.getResponseBuffer(0x0C);
+    loadVoltageNode.setProperty("voltage").send(String(loadVoltage));
+
+    loadCurrent = modbus.getResponseBuffer(0x0D);
+    loadCurrentNode.setProperty("current").send(String(loadCurrent));
+
+    loadPower = modbus.getResponseBuffer(0x0E) + (modbus.getResponseBuffer(0x0F) << 16);
+    loadPowerNode.setProperty("power").send(String(loadPower));
+
+    airTemp = modbus.getResponseBuffer(0x10);
+    airTempNode.setProperty("temperature").send(String(airTemp));
+
+    deviceTemp = modbus.getResponseBuffer(0x11);
+    deviceTempNode.setProperty("temperature").send(String(deviceTemp));
+  }
+  modbus.clearResponseBuffer();
+
+  result = modbus.readInputRegisters(0x311A, 1);
+  if (result == modbus.ku8MBSuccess) {
+    batteryPercent = modbus.getResponseBuffer(0x00);
+    batteryLevelNode.setProperty("level").send(String(batteryPercent));
+  }
+  modbus.clearResponseBuffer();
+
+  result = modbus.readInputRegisters(0x331A, 3);
+  if (result == modbus.ku8MBSuccess) {
+    batteryVoltage = modbus.getResponseBuffer(0x00);
+    batteryVoltageNode.setProperty("voltage").send(String(batteryVoltage));
+
+    batteryCurrent = modbus.getResponseBuffer(0x01) + (modbus.getResponseBuffer(0x02) << 16);
+    batteryCurrentNode.setProperty("current").send(String(batteryCurrent));
+  }
+  modbus.clearResponseBuffer();
+
+  result = modbus.readInputRegisters(0x3201, 2);
+  if (result == modbus.ku8MBSuccess) {
+    // Charging equipment status (0x3201)
+    // bit 0: running (1) / standby (0)
+    // bit 1: fault (1) / normal (0)
+    // bit 2/3: no charging (0) / float (1) / boost (2) / equalization (3)
+    batteryStatus = ((modbus.getResponseBuffer(0x00) & 0b1100) >> 2);
+    batteryStatusNode.setProperty("status").send(String(batteryStatus));
+  }
+  modbus.clearResponseBuffer();
+}
+
+bool rtcHandler(const HomieRange& range, const String& time) {
+    // time: hh:mm:ss
+    // rtcTime[0] seconds
+    // rtcTime[1] minutes
+    // rtcTime[2] hours
+    // rtcTime[3] day
+    // rtcTime[4] month/year
+    result = modbus.readHoldingRegisters(0x9014, 2);
+    if (result == modbus.ku8MBSuccess) {
+        rtcTime[3] = (modbus.getResponseBuffer(0x00) >> 8);
+        rtcTime[4] = modbus.getResponseBuffer(0x01);
     }
-  }
+    rtcTime[2] = time.substring(0, 2).toInt();
+    rtcTime[1] = time.substring(3, 5).toInt();
+    rtcTime[0] = time.substring(6, 8).toInt();
+    modbus.setTransmitBuffer(0, rtcTime[0] + (rtcTime[1] << 8));
+    modbus.setTransmitBuffer(1, rtcTime[2] + (rtcTime[3] << 8));
+    modbus.setTransmitBuffer(2, rtcTime[4]);
+    result = modbus.writeMultipleRegisters(0x9013, 3);
+    rtcNode.setProperty("time").send(time);
+    return (result == modbus.ku8MBSuccess);
 }
 
-void update_rtc()
+void loopHandler()
 {
-  result = node.readHoldingRegisters(0x9014, 2);
-  if (result == node.ku8MBSuccess) {
-    day = (node.getResponseBuffer(0x00) >> 8);
-    monthYear = node.getResponseBuffer(0x01);
-  }
-  timeClient.update();
-  node.clearTransmitBuffer();
-  node.setTransmitBuffer(0, timeClient.getSeconds() + (timeClient.getMinutes() << 8));
-  node.setTransmitBuffer(1, timeClient.getHours() + (day << 8));
-  node.setTransmitBuffer(2, monthYear);
-  result = node.writeMultipleRegisters(0x9013, 3);
-}
-
-void update_load(bool on)
-{
-  if (on && loadStatus == 0) {
-    // set manual mode
-    node.clearTransmitBuffer();
-    node.setTransmitBuffer(0, 0);
-    result = node.writeMultipleRegisters(0x903D, 1);
-    // set default off
-    node.clearTransmitBuffer();
-    node.setTransmitBuffer(0, 0);
-    result = node.writeMultipleRegisters(0x906A, 1);
-    // set load on
-    result = node.writeSingleCoil(0x0002, 1);
-    loadStatus = 1;
-
-  } else if (!on && loadStatus == 1) {
-    // set load off
-    result = node.writeSingleCoil(0x0002, 0);
-
-    // set automatic mode
-    node.clearTransmitBuffer();
-    node.setTransmitBuffer(0, 3);
-    result = node.writeMultipleRegisters(0x903D, 1);
-
-    // set 'use one time'
-    node.clearTransmitBuffer();
-    node.setTransmitBuffer(0, 0);
-    result = node.writeMultipleRegisters(0x9069, 1);
-
-    loadStatus = 0;
-  }
-
-}
-
-void publish_times()
-{
-  result = node.readHoldingRegisters(0x9042, 6);
-  if (result == node.ku8MBSuccess) {
-    timeon = "";
-    timeoff = "";
-    timeon.reserve(9);
-    timeoff.reserve(9);
-    sprintf(buf, "%02d", node.getResponseBuffer(0x02));
-    timeon += buf;
-    timeon += ":";
-    sprintf(buf, "%02d", node.getResponseBuffer(0x01));
-    timeon += buf;
-    timeon += ":";
-    sprintf(buf, "%02d", node.getResponseBuffer(0x00));
-    timeon += buf;
-    timeon.toCharArray(buf, 9);
-    mqttClient.publish("pond/time/on", buf);
-
-    sprintf(buf, "%02d", node.getResponseBuffer(0x05));
-    timeoff += buf;
-    timeoff += ":";
-    sprintf(buf, "%02d", node.getResponseBuffer(0x04));
-    timeoff += buf;
-    timeoff += ":";
-    sprintf(buf, "%02d", node.getResponseBuffer(0x03));
-    timeoff += buf;
-    timeoff.toCharArray(buf, 9);
-    mqttClient.publish("pond/time/off", buf);
-  }
-}
-
-void publish_values()
-{
-  result = node.readInputRegisters(0x3100, 18);
-  if (result == node.ku8MBSuccess) {
-    solarVoltage = node.getResponseBuffer(0x00);
-    itoa(solarVoltage, buf, 10);
-    mqttClient.publish("pond/solar/voltage", buf);
-
-    solarCurrent = node.getResponseBuffer(0x01);
-    itoa(solarCurrent, buf, 10);
-    mqttClient.publish("pond/solar/current", buf);
-
-    solarPower = node.getResponseBuffer(0x02) + (node.getResponseBuffer(0x03) << 16);
-    itoa(solarPower, buf, 10);
-    mqttClient.publish("pond/solar/power", buf);
-
-    loadVoltage = node.getResponseBuffer(0x0C);
-    itoa(loadVoltage, buf, 10);
-    mqttClient.publish("pond/load/voltage", buf);
-
-    loadCurrent = node.getResponseBuffer(0x0D);
-    itoa(loadCurrent, buf, 10);
-    mqttClient.publish("pond/load/current", buf);
-
-    loadPower = node.getResponseBuffer(0x0E) + (node.getResponseBuffer(0x0F) << 16);
-    itoa(loadPower, buf, 10);
-    mqttClient.publish("pond/load/power", buf);
-
-    batteryTemp = node.getResponseBuffer(0x10);
-    itoa(batteryTemp, buf, 10);
-    mqttClient.publish("pond/battery/temp", buf);
-
-    deviceTemp = node.getResponseBuffer(0x11);
-    itoa(deviceTemp, buf, 10);
-    mqttClient.publish("pond/temp", buf);
-  }
-  node.clearResponseBuffer();
-  delay(5);
-
-  result = node.readInputRegisters(0x311A, 1);
-  if (result == node.ku8MBSuccess) {
-    batteryPercent = node.getResponseBuffer(0x00);
-    itoa(batteryPercent, buf, 10);
-    mqttClient.publish("pond/battery/percent", buf);
-  }
-  node.clearResponseBuffer();
-  delay(5);
-
-  result = node.readInputRegisters(0x331A, 3);
-  if (result == node.ku8MBSuccess) {
-    batteryVoltage = node.getResponseBuffer(0x00);
-    itoa(batteryVoltage, buf, 10);
-    mqttClient.publish("pond/battery/voltage", buf);
-
-    batteryCurrent = node.getResponseBuffer(0x01) + (node.getResponseBuffer(0x02) << 16);
-    itoa(batteryCurrent, buf, 10);
-    mqttClient.publish("pond/battery/current", buf);
-  }
-  node.clearResponseBuffer();
-
-  result = node.readInputRegisters(0x3201, 2);
-  if (result == node.ku8MBSuccess) {
-    batteryStatus = ((node.getResponseBuffer(0x00) & 0x0B) >> 2);
-    itoa(batteryStatus, buf, 10);
-    mqttClient.publish("pond/battery/status", buf);
-
-    loadStatus = (node.getResponseBuffer(0x01) & 0x00);
-    itoa(loadStatus, buf, 10);
-    mqttClient.publish("pond/load/status", buf);
-  }
-  node.clearResponseBuffer();
-}
-
-void callback(char* topic, byte* payload, unsigned int length)
-{
-  if (strcmp(topic, "pond/load/status") == 0) {
-    if ((char)payload[0] == '1') {
-      update_load(true);
-    } else if ((char)payload[0] == '0') {
-      update_load(false);
-    }
-  } else {
-    // set time values
-    msg.reserve(10);
-    msg = "";
-    msg = (char*)payload;
-    node.clearTransmitBuffer();
-    node.setTransmitBuffer(0, msg.substring(6, 8).toInt());
-    node.setTransmitBuffer(1, msg.substring(3, 5).toInt());
-    node.setTransmitBuffer(2, msg.substring(0, 2).toInt());
-
-    if (strcmp(topic, "pond/set_time/on") == 0) {
-      result = node.writeMultipleRegisters(0x9042, 3);
-    }
-    else if (strcmp(topic, "pond/set_time/off") == 0) {
-      result = node.writeMultipleRegisters(0x9045, 3);
-    }
+  if (millis() - lastStatsSent >= statsIntervalSetting.get() * 1000UL || lastStatsSent == 0) {
+    publishStats();
+    lastStatsSent = millis();
   }
 }
 
 void setup()
 {
+  Homie.disableLogging();
+
   Serial.begin(115200);
   delay(10);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    delay(500);
-    ESP.restart();
-  }
-  node.begin(EPSOLAR_DEVICE_ID, Serial);
-  mqttClient.setServer(mqtt_server, 1883);
-  mqttClient.setCallback(callback);
-  timeClient.begin();
-  ArduinoOTA.begin();
-}
+  modbus.begin(EPSOLAR_DEVICE_ID, Serial);
 
+  Homie_setFirmware("epsolar-controller", "1.0.4");
+  Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
+
+  batteryCurrentNode.advertise("current");
+  batteryCurrentNode.advertise("unit");
+  batteryLevelNode.advertise("level");
+  batteryLevelNode.advertise("unit");
+  batteryStatusNode.advertise("status");
+  airTempNode.advertise("temperature");
+  airTempNode.advertise("unit");
+  batteryVoltageNode.advertise("voltage");
+  batteryVoltageNode.advertise("unit");
+
+  deviceTempNode.advertise("temperature");
+  deviceTempNode.advertise("unit");
+
+  loadCurrentNode.advertise("current");
+  loadCurrentNode.advertise("unit");
+  loadPowerNode.advertise("power");
+  loadPowerNode.advertise("unit");
+  loadVoltageNode.advertise("voltage");
+  loadVoltageNode.advertise("unit");
+
+  solarCurrentNode.advertise("unit");
+  solarCurrentNode.advertise("current");
+  solarPowerNode.advertise("unit");
+  solarPowerNode.advertise("power");
+  solarVoltageNode.advertise("voltage");
+  solarVoltageNode.advertise("unit");
+
+  rtcNode.advertise("time").settable(rtcHandler);
+
+  statsIntervalSetting.setDefaultValue(DEFAULT_STATS_INTERVAL).setValidator([] (long candidate) {
+    return candidate > 0;
+  });
+
+  Homie.setup();
+}
 
 void loop()
 {
-  ArduinoOTA.handle();
-
-  if (!mqttClient.connected()) {
-    reconnect_mqtt();
-  }
-
-  mqttClient.loop();
-
-  unsigned long currentMillis = millis();
-
-  if (currentMillis - previousMillis >= interval) {
-    if (currentMillis - previousMillis >= rtcInterval) {
-      update_rtc();
-    }
-    previousMillis = currentMillis;
-    publish_values();
-    publish_times();
-  }
+  Homie.loop();
 }
