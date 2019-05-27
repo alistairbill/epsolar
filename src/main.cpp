@@ -1,105 +1,83 @@
+#include <Arduino.h>
 #include <Homie.h>
 #include <ModbusMaster.h>
+#include <Timer.h>
 
-#define EPSOLAR_DEVICE_ID 1
+#define FW_NAME "epsolar-controller"
+#define FW_VERSION "1.1.0"
 
-uint16_t batteryPercent, batteryVoltage, batteryStatus,
-  loadCurrent, loadVoltage,
-  solarVoltage, solarCurrent;
-int16_t airTemp, deviceTemp;
-uint32_t solarPower, loadPower;
-int32_t batteryCurrent;
-uint8_t result;
-int rtcTime[5];
-
-const int DEFAULT_STATS_INTERVAL = 120;
-
-unsigned long lastStatsSent = 0;
+const int DEFAULT_DEEP_SLEEP_MINUTES = 2;
 
 ModbusMaster modbus;
+Timer sleepTimer;
 
-HomieNode batteryCurrentNode("battery-current", "current");
-HomieNode batteryLevelNode("battery-level", "fraction");
-HomieNode batteryStatusNode("battery-status", "status");
-HomieNode batteryVoltageNode("battery-voltage", "voltage");
+HomieNode sensorNode("epsolarsensor", "EPSolar Sensor", "epsolarsensor");
+HomieSetting<long> statsIntervalSetting("statsInterval", "The sleep duration in minutes (maximum 71 minutes)");
 
-HomieNode airTempNode("air-temperature", "temperature");
-HomieNode deviceTempNode("device-temperature", "temperature");
+const int PIN_RE_NEG = D1;
+const int PIN_DE = D2;
 
-HomieNode loadCurrentNode("load-current", "current");
-HomieNode loadPowerNode("load-power", "power");
-HomieNode loadVoltageNode("load-voltage", "voltage");
+const int EPSOLAR_DEVICE_ID = 0x01;
+unsigned long time_now = 0;
 
-HomieNode solarCurrentNode("solar-current", "current");
-HomieNode solarPowerNode("solar-power", "power");
-HomieNode solarVoltageNode("solar-voltage", "voltage");
-
-HomieNode rtcNode("rtc", "time");
-
-HomieSetting<long> statsIntervalSetting("statsInterval", "The stats interval in seconds");
-
-void setupHandler()
-{
-  batteryCurrentNode.setProperty("unit").send("A");
-  batteryLevelNode.setProperty("unit").send("%");
-  batteryVoltageNode.setProperty("unit").send("V");
-
-  airTempNode.setProperty("unit").send("°C");
-  deviceTempNode.setProperty("unit").send("°C");
-
-  loadCurrentNode.setProperty("unit").send("A");
-  loadPowerNode.setProperty("unit").send("W");
-  loadVoltageNode.setProperty("unit").send("V");
-
-  solarCurrentNode.setProperty("unit").send("A");
-  solarPowerNode.setProperty("unit").send("W");
-  solarVoltageNode.setProperty("unit").send("V");
+void prepareSleep() {
+  Homie.prepareToSleep();
 }
 
 void publishStats()
 {
+  uint32_t solar_power, load_power;
+  int32_t battery_current;
+  uint16_t battery_percent, battery_voltage, battery_status, load_current,
+           load_voltage, solar_voltage, solar_current;
+  int16_t air_temp, device_temp;
+  uint8_t result;
+
   result = modbus.readInputRegisters(0x3100, 18);
   if (result == modbus.ku8MBSuccess) {
-    solarVoltage = modbus.getResponseBuffer(0x00);
-    solarVoltageNode.setProperty("voltage").send(String(solarVoltage));
+    solar_voltage = modbus.getResponseBuffer(0x00);
+    sensorNode.setProperty("solar-voltage").send(String(solar_voltage));
 
-    solarCurrent = modbus.getResponseBuffer(0x01);
-    solarCurrentNode.setProperty("current").send(String(solarCurrent));
+    solar_current = modbus.getResponseBuffer(0x01);
+    sensorNode.setProperty("solar-current").send(String(solar_current));
 
-    solarPower = modbus.getResponseBuffer(0x02) + (modbus.getResponseBuffer(0x03) << 16);
-    solarPowerNode.setProperty("power").send(String(solarPower));
+    solar_power = modbus.getResponseBuffer(0x02)
+                | (modbus.getResponseBuffer(0x03) << 16);
+    sensorNode.setProperty("solar-power").send(String(solar_power));
 
-    loadVoltage = modbus.getResponseBuffer(0x0C);
-    loadVoltageNode.setProperty("voltage").send(String(loadVoltage));
+    load_voltage = modbus.getResponseBuffer(0x0C);
+    sensorNode.setProperty("load-voltage").send(String(load_voltage));
 
-    loadCurrent = modbus.getResponseBuffer(0x0D);
-    loadCurrentNode.setProperty("current").send(String(loadCurrent));
+    load_current = modbus.getResponseBuffer(0x0D);
+    sensorNode.setProperty("load-current").send(String(load_current));
 
-    loadPower = modbus.getResponseBuffer(0x0E) + (modbus.getResponseBuffer(0x0F) << 16);
-    loadPowerNode.setProperty("power").send(String(loadPower));
+    load_power = modbus.getResponseBuffer(0x0E)
+               | (modbus.getResponseBuffer(0x0F) << 16);
+    sensorNode.setProperty("load-power").send(String(load_power));
 
-    airTemp = modbus.getResponseBuffer(0x10);
-    airTempNode.setProperty("temperature").send(String(airTemp));
+    air_temp = modbus.getResponseBuffer(0x10);
+    sensorNode.setProperty("air-temperature").send(String(air_temp));
 
-    deviceTemp = modbus.getResponseBuffer(0x11);
-    deviceTempNode.setProperty("temperature").send(String(deviceTemp));
+    device_temp = modbus.getResponseBuffer(0x11);
+    sensorNode.setProperty("device-temperature").send(String(device_temp));
   }
   modbus.clearResponseBuffer();
 
   result = modbus.readInputRegisters(0x311A, 1);
   if (result == modbus.ku8MBSuccess) {
-    batteryPercent = modbus.getResponseBuffer(0x00);
-    batteryLevelNode.setProperty("level").send(String(batteryPercent));
+    battery_percent = modbus.getResponseBuffer(0x00);
+    sensorNode.setProperty("battery-level").send(String(battery_percent));
   }
   modbus.clearResponseBuffer();
 
   result = modbus.readInputRegisters(0x331A, 3);
   if (result == modbus.ku8MBSuccess) {
-    batteryVoltage = modbus.getResponseBuffer(0x00);
-    batteryVoltageNode.setProperty("voltage").send(String(batteryVoltage));
+    battery_voltage = modbus.getResponseBuffer(0x00);
+    sensorNode.setProperty("battery-voltage").send(String(battery_voltage));
 
-    batteryCurrent = modbus.getResponseBuffer(0x01) + (modbus.getResponseBuffer(0x02) << 16);
-    batteryCurrentNode.setProperty("current").send(String(batteryCurrent));
+    battery_current = modbus.getResponseBuffer(0x01)
+                    | (modbus.getResponseBuffer(0x02) << 16);
+    sensorNode.setProperty("battery-current").send(String(battery_current));
   }
   modbus.clearResponseBuffer();
 
@@ -109,40 +87,24 @@ void publishStats()
     // bit 0: running (1) / standby (0)
     // bit 1: fault (1) / normal (0)
     // bit 2/3: no charging (0) / float (1) / boost (2) / equalization (3)
-    batteryStatus = ((modbus.getResponseBuffer(0x00) & 0b1100) >> 2);
-    batteryStatusNode.setProperty("status").send(String(batteryStatus));
+    battery_status = (modbus.getResponseBuffer(0x00) >> 2) & 0x3;
+    sensorNode.setProperty("battery-status").send(String(battery_status));
   }
   modbus.clearResponseBuffer();
 }
 
-bool rtcHandler(const HomieRange& range, const String& time) {
-    // time: hh:mm:ss
-    // rtcTime[0] seconds
-    // rtcTime[1] minutes
-    // rtcTime[2] hours
-    // rtcTime[3] day
-    // rtcTime[4] month/year
-    result = modbus.readHoldingRegisters(0x9014, 2);
-    if (result == modbus.ku8MBSuccess) {
-        rtcTime[3] = (modbus.getResponseBuffer(0x00) >> 8);
-        rtcTime[4] = modbus.getResponseBuffer(0x01);
-    }
-    rtcTime[2] = time.substring(0, 2).toInt();
-    rtcTime[1] = time.substring(3, 5).toInt();
-    rtcTime[0] = time.substring(6, 8).toInt();
-    modbus.setTransmitBuffer(0, rtcTime[0] + (rtcTime[1] << 8));
-    modbus.setTransmitBuffer(1, rtcTime[2] + (rtcTime[3] << 8));
-    modbus.setTransmitBuffer(2, rtcTime[4]);
-    result = modbus.writeMultipleRegisters(0x9013, 3);
-    rtcNode.setProperty("time").send(time);
-    return (result == modbus.ku8MBSuccess);
-}
 
-void loopHandler()
-{
-  if (millis() - lastStatsSent >= statsIntervalSetting.get() * 1000UL || lastStatsSent == 0) {
-    publishStats();
-    lastStatsSent = millis();
+void onHomieEvent(const HomieEvent& event) {
+  switch (event.type) {
+    case HomieEventType::MQTT_READY:
+      publishStats();
+      sleepTimer.after(100, prepareSleep);
+      break;
+    case HomieEventType::READY_TO_SLEEP:
+      Homie.doDeepSleep(statsIntervalSetting.get() * 60 * 1000 * 1000);
+      break;
+    default:
+      break;
   }
 }
 
@@ -151,49 +113,93 @@ void setup()
   Homie.disableLogging();
 
   Serial.begin(115200);
-  delay(10);
   modbus.begin(EPSOLAR_DEVICE_ID, Serial);
 
-  Homie_setFirmware("epsolar-controller", "1.0.4");
-  Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
+  // Set GPIO16 (= D0) pin mode to allow for deep sleep.
+  // connect D0 to RST for this to work
+  pinMode(D0, WAKEUP_PULLUP);
 
-  batteryCurrentNode.advertise("current");
-  batteryCurrentNode.advertise("unit");
-  batteryLevelNode.advertise("level");
-  batteryLevelNode.advertise("unit");
-  batteryStatusNode.advertise("status");
-  airTempNode.advertise("temperature");
-  airTempNode.advertise("unit");
-  batteryVoltageNode.advertise("voltage");
-  batteryVoltageNode.advertise("unit");
-
-  deviceTempNode.advertise("temperature");
-  deviceTempNode.advertise("unit");
-
-  loadCurrentNode.advertise("current");
-  loadCurrentNode.advertise("unit");
-  loadPowerNode.advertise("power");
-  loadPowerNode.advertise("unit");
-  loadVoltageNode.advertise("voltage");
-  loadVoltageNode.advertise("unit");
-
-  solarCurrentNode.advertise("unit");
-  solarCurrentNode.advertise("current");
-  solarPowerNode.advertise("unit");
-  solarPowerNode.advertise("power");
-  solarVoltageNode.advertise("voltage");
-  solarVoltageNode.advertise("unit");
-
-  rtcNode.advertise("time").settable(rtcHandler);
-
-  statsIntervalSetting.setDefaultValue(DEFAULT_STATS_INTERVAL).setValidator([] (long candidate) {
-    return candidate > 0;
+  statsIntervalSetting.setDefaultValue(DEFAULT_DEEP_SLEEP_MINUTES)
+                      .setValidator([] (long candidate) {
+    // 72 minutes is the maximum sleep time supported by ESP8266:
+    // https://thingpulse.com/max-deep-sleep-for-esp8266/
+    return candidate > 0 && candidate <= 70;
   });
 
+  if (Homie.isConfigured()) {
+    WiFi.disconnect();
+  }
+
+  Homie_setFirmware(FW_NAME, FW_VERSION);
+
+  sensorNode.advertise("battery-current")
+            .setDatatype("float")
+            .setName("Battery current")
+            .setUnit("A");
+
+  sensorNode.advertise("battery-level")
+            .setDatatype("float")
+            .setFormat("0:100")
+            .setName("Battery level")
+            .setUnit("%");
+
+  sensorNode.advertise("battery-status")
+            .setDatatype("integer")
+            .setName("Battery status")
+            .setUnit("");
+
+  sensorNode.advertise("battery-voltage")
+            .setDatatype("float")
+            .setName("Battery voltage")
+            .setUnit("V");
+
+  sensorNode.advertise("air-temperature")
+            .setDatatype("float")
+            .setName("Air temperature")
+            .setUnit("°C");
+
+  sensorNode.advertise("device-temperature")
+            .setDatatype("float")
+            .setName("Device temperature")
+            .setUnit("°C");
+
+  sensorNode.advertise("load-current")
+            .setDatatype("float")
+            .setName("Load current")
+            .setUnit("A");
+
+  sensorNode.advertise("load-power")
+            .setDatatype("float")
+            .setName("Load power")
+            .setUnit("W");
+
+  sensorNode.advertise("load-voltage")
+            .setDatatype("float")
+            .setName("Load voltage")
+            .setUnit("V");
+
+  sensorNode.advertise("solar-current")
+            .setDatatype("float")
+            .setName("Solar current")
+            .setUnit("A");
+
+  sensorNode.advertise("solar-power")
+            .setDatatype("float")
+            .setName("Solar power")
+            .setUnit("W");
+
+  sensorNode.advertise("solar-voltage")
+            .setDatatype("float")
+            .setName("Solar voltage")
+            .setUnit("V");
+
+  Homie.onEvent(onHomieEvent);
+  Homie.disableLedFeedback();
   Homie.setup();
 }
 
 void loop()
 {
   Homie.loop();
+  sleepTimer.update();
 }
