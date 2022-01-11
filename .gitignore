@@ -1,3 +1,8 @@
-.pioenvs
-.piolibdeps
-compile_commands.json
+*.py[cod]
+*.egg-info
+__pycache__
+*.mpy
+
+lib
+.vscode
+settings.py

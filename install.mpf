@@ -1,0 +1,17 @@
+md lib
+cd lib
+
+md uModbus
+cd uModbus
+lcd uModbus
+put functions.mpy
+put serial.mpy
+
+lcd ..
+cd /
+
+put app.py
+put settings.py
+
+put boot.py
+put main.py
