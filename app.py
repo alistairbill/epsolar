@@ -4,63 +4,105 @@ import struct
 
 import settings
 
-from homie.device import HomieDevice, _MESSAGE
+from homie.device import HomieDevice, await_ready_state
 from homie.node import HomieNode
 from homie.property import HomieProperty
 from homie.constants import FLOAT, INTEGER
 from uModbus.serial import Serial
 
+_DATA = asyncio.Event()
+
+class Register:
+    def __init__(self, address: int, quantity: int = 1, fmt: str = ">H"):
+        self.address = address
+        self.quantity = quantity
+        self.fmt = fmt
+
+    def parse(self, res: bytearray) -> int:
+        return struct.unpack(self.fmt, res)[0]
+
+class ShortRegister(Register):
+    def __init__(self, address: int, signed: bool = False):
+        super().__init__(address, 1, ">h" if signed else ">H")
+
+class LongRegister(Register):
+    def __init__(self, address: int, signed: bool = False):
+        super().__init__(address, 2, ">l" if signed else ">L")
+    def parse(self, res: bytearray) -> int:
+        res = res[2:] + res[:2]
+        return struct.unpack(self.fmt, res)[0]
+
+class StatusRegister(Register):
+    def parse(self, res: bytearray) -> int:
+        return (res[1] >> 2) & 3
+
+class Property(HomieProperty):
+    def __init__(self, *args, **kwargs):
+        super().__init__(restore=False, datatype=INTEGER, *args, **kwargs)
+
+    def publish(self):
+        # Only publish once
+        if not _DATA.is_set():
+            super().publish()
 
 class EPSolar(HomieNode):
     def __init__(self, name="EPSolar Sensor"):
         super().__init__(id="epsolarsensor", name=name, type="epsolarsensor")
-        self.modbus = Serial(0, 115200)
-        uint16 = (1, ">H")
-        uint32 = (2, ">L")
-        int16 = (1, ">h")
-        int32 = (2, ">l")
-        status = (1, ">H")
+        self.modbus = Serial(0, baudrate=115200)
         self.registers = [
-            (HomieProperty(restore=False, id="solar-voltage", datatype=FLOAT, name="Solar voltage", unit="V"), 0x3100, uint16),
-            (HomieProperty(restore=False, id="solar-current", datatype=FLOAT, name="Solar current", unit="A"), 0x3101, uint16),
-            (HomieProperty(restore=False, id="solar-power", datatype=FLOAT, name="Solar power", unit="W"), 0x3102, uint32),
-            (HomieProperty(restore=False, id="load-voltage", datatype=FLOAT, name="Load voltage", unit="V"), 0x310c, uint16),
-            (HomieProperty(restore=False, id="load-current", datatype=FLOAT, name="Load current", unit="A"), 0x310d, uint16),
-            (HomieProperty(restore=False, id="load-power", datatype=FLOAT, name="Load power", unit="W"), 0x310e, uint32),
-            (HomieProperty(restore=False, id="air-temperature", datatype=FLOAT, name="Air temperature", unit="°C"), 0x3110, int16),
-            (HomieProperty(restore=False, id="device-temperature", datatype=FLOAT, name="Device temperature", unit="°C"), 0x3111, int16),
-            (HomieProperty(restore=False, id="battery-level", datatype=FLOAT, name="Battery level", unit="%", format="0:100"), 0x311a, uint16),
-            (HomieProperty(restore=False, id="battery-voltage", datatype=FLOAT, name="Battery voltage", unit="V"), 0x331a, uint16),
-            (HomieProperty(restore=False, id="battery-current", datatype=FLOAT, name="Battery current", unit="A"), 0x331b, int32),
-            (HomieProperty(restore=False, id="battery-status", datatype=INTEGER, name="Battery status"), 0x3201, status),
+            (Property(id="solar-voltage", name="Solar voltage", unit="V"), ShortRegister(0x3100)),
+            (Property(id="solar-current", name="Solar current", unit="A"), ShortRegister(0x3101)),
+            (Property(id="solar-power", name="Solar power", unit="W"), LongRegister(0x3102)),
+            (Property(id="load-voltage", name="Load voltage", unit="V"), ShortRegister(0x310c)),
+            (Property(id="load-current", name="Load current", unit="A"), ShortRegister(0x310d)),
+            (Property(id="load-power", name="Load power", unit="W"), LongRegister(0x310e)),
+            (Property(id="air-temperature", name="Air temperature", unit="°C"), ShortRegister(0x3110, signed=True)),
+            (Property(id="device-temperature", name="Device temperature", unit="°C"), ShortRegister(0x3111, signed=True)),
+            (Property(id="battery-level", name="Battery level", unit="%", format="0:100"), ShortRegister(0x311a)),
+            (Property(id="battery-voltage", name="Battery voltage", unit="V"), ShortRegister(0x331a)),
+            (Property(id="battery-current", name="Battery current", unit="A"), LongRegister(0x331b, signed=True)),
+            (Property(id="battery-status", name="Battery status"), StatusRegister(0x3201)),
         ]
-        for prop, _, _ in self.registers:
+        for prop, _ in self.registers:
             self.add_property(prop)
         asyncio.create_task(self.update_data())
 
 
     async def update_data(self):
-        for prop, address, (quantity, fmt) in self.registers:
-            try:
-                res = await self.modbus.read_input_registers(1, address, quantity)
-                prop.data = struct.unpack(fmt, res)[0]
-            except asyncio.TimeoutError:
-                dprint("modbus: timed out")
+        for prop, reg in self.registers:
+            for _ in range(3):
+                try:
+                    await asyncio.sleep_ms(50) # don't send messages too fast
+                    res = await asyncio.wait_for_ms(self.modbus.read_input_registers(1, reg.address, reg.quantity), 500)
+                    prop.data = reg.parse(res)
+                except (ValueError, asyncio.TimeoutError):
+                    dprint("modbus failed, retrying")
+                else:
+                    break
+            else:
+                dprint("modbus failed", prop.id)
+        _DATA.set()
 
 
     async def publish_properties(self):
         if machine.reset_cause() != machine.DEEPSLEEP_RESET:
             return await super().publish_properties()
 
-async def deep_sleep(secs: int, mqtt):
-    try:
-        await asyncio.wait_for(_MESSAGE.wait(), 20)
-        dprint("deep sleep: machine ready")
+@await_ready_state
+async def wait_data():
+    await _DATA.wait()
 
-        await asyncio.wait_for(mqtt.disconnect(), 1)
+async def deep_sleep(secs: int, mqtt):
+    wait_secs = 30 if machine.reset_cause() == machine.DEEPSLEEP_RESET else 60
+    try:
+        await asyncio.wait_for(wait_data(), wait_secs)
+        dprint("deep sleep: machine ready")
+        await asyncio.sleep(5)
+        if mqtt.isconnected():
+            await asyncio.wait_for(mqtt.disconnect(), 1)
     except asyncio.TimeoutError:
         dprint("deep sleep: timed out")
-    await asyncio.sleep_ms(500)
+    await asyncio.sleep(1)
     rtc = machine.RTC()
     rtc.irq(trigger=rtc.ALARM0, wake=machine.DEEPSLEEP)
     rtc.alarm(rtc.ALARM0, 1000 * secs)
