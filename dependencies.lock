@@ -1,0 +1,32 @@
+dependencies:
+  espressif/esp-modbus:
+    component_hash: a52eabcf5e1f81f16f730c70981e69338ea33aee9c44fa512c644d1d8942aa16
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.1.3
+  espressif/esp-zigbee-lib:
+    component_hash: 8e815d149f904b3429100d8735a2ed81dea38caff3e2b5e38e5751ffc0af6d89
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.0.3
+  idf:
+    source:
+      type: idf
+    version: 6.0.2
+direct_dependencies:
+- espressif/esp-modbus
+- espressif/esp-zigbee-lib
+- idf
+manifest_hash: 7850ec2b6a1c641fbc39aaf9aaec4c335f5d33850d868aee4b62e0eb87b2f13b
+target: esp32c6
+version: 3.0.0

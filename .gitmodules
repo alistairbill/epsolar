@@ -1,3 +1,0 @@
-[submodule "components/homie"]
-	path = components/homie
-	url = git@github.com:alistairbill/esp-homie.git

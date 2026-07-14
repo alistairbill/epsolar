@@ -1,43 +1,35 @@
-menu "EPSolar Controller"
-config WIFI_SSID
-    string "WiFi SSID"
-    default "myssid"
-    help
-        SSID (network name) to connect to.
+menu "EPSolar Zigbee sensor"
 
-config WIFI_PASSWORD
-    string "WiFi Password"
-    default "mypassword"
-    help
-        WiFi password (WPA or WPA2).
-
-config MQTT_URI
-    string "MQTT Broker URI"
-    default "mqtt://test.example.org:1883"
-    help
-        URI to the MQTT broker.
-
-config MQTT_USERNAME
-    string "MQTT Username"
-    default ""
-    help
-        Username for connecting to the MQTT broker.
-
-config MQTT_PASSWORD
-    string "MQTT Password"
-    default ""
-    help
-        Password for connecting to the MQTT broker.
-
-config SLEEP_DURATION
-    int "Sleep duration (secs)"
+config EPSOLAR_UPDATE_INTERVAL_SECONDS
+    int "Telemetry update interval (seconds)"
+    range 1 86400
     default 60
     help
-        Seconds to sleep between MQTT updates.
+        Time between Modbus reads and Zigbee attribute updates.
 
-config OTA_URL
-    string "OTA firmware URL"
-    default "http://example.org/build/example.bin"
-    help
-        URL to the firmware binary.
+config EPSOLAR_MODBUS_UART_PORT
+    int "Modbus UART port"
+    range 0 1
+    default 1
+
+config EPSOLAR_MODBUS_TX_GPIO
+    int "Modbus UART TX GPIO"
+    range 0 30
+    default 5
+
+config EPSOLAR_MODBUS_RX_GPIO
+    int "Modbus UART RX GPIO"
+    range 0 30
+    default 4
+
+config EPSOLAR_MODBUS_BAUD_RATE
+    int "Modbus baud rate"
+    range 1200 115200
+    default 115200
+
+config EPSOLAR_MODBUS_SLAVE_ADDRESS
+    int "Modbus slave address"
+    range 1 247
+    default 1
+
 endmenu

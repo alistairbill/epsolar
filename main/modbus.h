@@ -1,8 +1,18 @@
-#ifndef __MODBUS__H__
-#define __MODBUS__H__
-#include <esp_err.h>
+#pragma once
 
-esp_err_t modbus_init(void);
-int modbus_read_input_registers(uint8_t slave_id, uint16_t start_address, uint16_t num_registers, uint16_t *out_buf);
+#include <stdint.h>
 
-#endif
+#include "esp_err.h"
+
+typedef struct {
+    void *handle;
+} epsolar_modbus_t;
+
+esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus);
+void epsolar_modbus_deinit(epsolar_modbus_t *modbus);
+esp_err_t epsolar_modbus_read_input_registers(
+    epsolar_modbus_t *modbus,
+    uint16_t start_address,
+    uint16_t register_count,
+    uint16_t *registers
+);
