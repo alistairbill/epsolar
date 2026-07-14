@@ -6,10 +6,31 @@
 #include "esp_check.h"
 #include "esp_modbus_master.h"
 
-#define MODBUS_READ_INPUT_REGISTERS 0x04
 #define MODBUS_RESPONSE_TIMEOUT_MS 500
 
 static const char *TAG = "epsolar_modbus";
+#define BLOCK_DESCRIPTOR(block_id, key, address, count)       \
+    {                                                          \
+        .cid = (block_id),                                     \
+        .param_key = (key),                                    \
+        .param_units = "",                                     \
+        .mb_slave_addr = CONFIG_EPSOLAR_MODBUS_SLAVE_ADDRESS,  \
+        .mb_param_type = MB_PARAM_INPUT,                       \
+        .mb_reg_start = (address),                             \
+        .mb_size = (count),                                    \
+        .param_type = PARAM_TYPE_BIN,                          \
+        .param_size = (count) * sizeof(uint16_t),              \
+        .access = PAR_PERMS_READ,                              \
+    }
+
+static const mb_parameter_descriptor_t register_blocks[] = {
+    BLOCK_DESCRIPTOR(EPSOLAR_MODBUS_BLOCK_ARRAY, "array", 0x3100, 4),
+    BLOCK_DESCRIPTOR(EPSOLAR_MODBUS_BLOCK_LOAD, "load", 0x310c, 4),
+    BLOCK_DESCRIPTOR(EPSOLAR_MODBUS_BLOCK_TEMPERATURES, "temperatures", 0x3110, 2),
+    BLOCK_DESCRIPTOR(EPSOLAR_MODBUS_BLOCK_BATTERY_LEVEL, "battery_level", 0x311a, 1),
+    BLOCK_DESCRIPTOR(EPSOLAR_MODBUS_BLOCK_STATUS, "status", 0x3200, 3),
+    BLOCK_DESCRIPTOR(EPSOLAR_MODBUS_BLOCK_BATTERY_ELECTRICAL, "battery_electrical", 0x331a, 3),
+};
 
 esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus)
 {
@@ -39,6 +60,13 @@ esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus)
         UART_PIN_NO_CHANGE
     );
     if (err == ESP_OK) {
+        err = mbc_master_set_descriptor(
+            modbus->handle,
+            register_blocks,
+            EPSOLAR_MODBUS_BLOCK_COUNT
+        );
+    }
+    if (err == ESP_OK) {
         err = mbc_master_start(modbus->handle);
     }
     if (err != ESP_OK) {
@@ -57,21 +85,32 @@ void epsolar_modbus_deinit(epsolar_modbus_t *modbus)
     modbus->handle = NULL;
 }
 
-esp_err_t epsolar_modbus_read_input_registers(
+esp_err_t epsolar_modbus_read_block(
     epsolar_modbus_t *modbus,
-    uint16_t start_address,
-    uint16_t register_count,
+    epsolar_modbus_block_t block,
     uint16_t *registers
 )
 {
     ESP_RETURN_ON_FALSE(modbus != NULL && modbus->handle != NULL, ESP_ERR_INVALID_STATE, TAG, "Modbus not initialized");
-    ESP_RETURN_ON_FALSE(registers != NULL && register_count > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid read buffer");
+    ESP_RETURN_ON_FALSE(
+        registers != NULL && block < EPSOLAR_MODBUS_BLOCK_COUNT,
+        ESP_ERR_INVALID_ARG,
+        TAG,
+        "Invalid register block"
+    );
 
-    mb_param_request_t request = {
-        .slave_addr = CONFIG_EPSOLAR_MODBUS_SLAVE_ADDRESS,
-        .command = MODBUS_READ_INPUT_REGISTERS,
-        .reg_start = start_address,
-        .reg_size = register_count,
-    };
-    return mbc_master_send_request(modbus->handle, &request, registers);
+    uint8_t parameter_type = 0;
+    esp_err_t err = mbc_master_get_parameter(
+        modbus->handle,
+        block,
+        (uint8_t *)registers,
+        &parameter_type
+    );
+    ESP_RETURN_ON_FALSE(
+        err != ESP_OK || parameter_type == PARAM_TYPE_BIN,
+        ESP_ERR_INVALID_RESPONSE,
+        TAG,
+        "Unexpected Modbus parameter type"
+    );
+    return err;
 }

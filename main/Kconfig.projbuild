@@ -11,6 +11,9 @@ config EPSOLAR_MODBUS_UART_PORT
     int "Modbus UART port"
     range 0 1
     default 1
+    help
+        UART0 and UART1 are the ESP32-C6 high-performance UARTs. UART1 is
+        used by default so USB Serial/JTAG remains available for logs.
 
 config EPSOLAR_MODBUS_TX_GPIO
     int "Modbus UART TX GPIO"
