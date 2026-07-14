@@ -147,6 +147,18 @@ const fromAnalogInput = {
     },
 };
 
+const fromPowerConfiguration = {
+    cluster: 'genPowerCfg',
+    type: ['attributeReport', 'readResponse'],
+    convert: (model, msg) => {
+        const value = msg.data.batteryPercentageRemaining;
+        if (msg.endpoint.ID !== 2 || value === undefined || value === 0xff) {
+            return;
+        }
+        return {battery: value / 2};
+    },
+};
+
 function numeric(name, unit, description) {
     const expose = e.numeric(name, ea.STATE).withDescription(description);
     return unit ? expose.withUnit(unit) : expose;
@@ -199,13 +211,14 @@ const definition = {
     model: 'EPSolar Zigbee',
     vendor: 'DIY Solar',
     description: 'EPSolar solar controller telemetry bridge',
-    fromZigbee: [fromElectricalMeasurement, fromTemperature, fromAnalogInput],
+    fromZigbee: [fromElectricalMeasurement, fromTemperature, fromAnalogInput, fromPowerConfiguration],
     toZigbee: [],
     exposes: [
         numeric('array_voltage', 'V', 'Solar array voltage'),
         numeric('array_current', 'A', 'Solar array current'),
         numeric('array_power', 'W', 'Solar array power'),
         numeric('battery_temperature', '°C', 'Solar battery temperature'),
+        e.battery(),
         numeric('battery_state_of_charge', '%', 'Solar battery state of charge').withValueMin(0).withValueMax(100),
         numeric('battery_voltage', 'V', 'Solar battery voltage'),
         numeric('battery_current', 'A', 'Solar battery current'),
@@ -244,6 +257,21 @@ const definition = {
             await reporting.temperature(endpoint, {min: 10, max: 300, change: 10});
             await endpoint.read('msTemperatureMeasurement', ['measuredValue']);
         }
+
+        const batteryEndpoint = device.getEndpoint(2);
+        if (!batteryEndpoint) {
+            throw new Error('Missing battery endpoint 2');
+        }
+        await reporting.bind(batteryEndpoint, coordinatorEndpoint, ['genPowerCfg']);
+        await batteryEndpoint.configureReporting('genPowerCfg', [
+            {
+                attribute: 'batteryPercentageRemaining',
+                minimumReportInterval: 10,
+                maximumReportInterval: 300,
+                reportableChange: 2,
+            },
+        ]);
+        await batteryEndpoint.read('genPowerCfg', ['batteryPercentageRemaining']);
 
         for (const id of Object.keys(analogInputs)) {
             const endpoint = device.getEndpoint(Number(id));

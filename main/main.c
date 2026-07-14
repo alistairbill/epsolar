@@ -87,6 +87,42 @@ static int16_t clamp_zcl_measurement(int64_t value)
     return (int16_t)value;
 }
 
+static uint8_t clamp_battery_percentage(uint16_t percentage)
+{
+    return percentage > 100U ? 100U : (uint8_t)percentage;
+}
+
+static uint8_t battery_power_source_level(uint8_t percentage)
+{
+    if (percentage == 0U) {
+        return EZB_AF_NODE_POWER_SOURCE_LEVEL_CRITICAL;
+    }
+    if (percentage <= 33U) {
+        return EZB_AF_NODE_POWER_SOURCE_LEVEL_33_PERCENT;
+    }
+    if (percentage <= 66U) {
+        return EZB_AF_NODE_POWER_SOURCE_LEVEL_66_PERCENT;
+    }
+    return EZB_AF_NODE_POWER_SOURCE_LEVEL_100_PERCENT;
+}
+
+static bool set_battery_power_descriptor(uint8_t source_level)
+{
+    ezb_af_node_power_desc_t descriptor = {
+        .current_power_mode = EZB_AF_NODE_POWER_MODE_SYNC_ON_WHEN_IDLE,
+        .available_power_sources = EZB_AF_NODE_POWER_SOURCE_RECHARGEABLE_BATTERY,
+        .current_power_source = EZB_AF_NODE_POWER_SOURCE_RECHARGEABLE_BATTERY,
+        .current_power_source_level = source_level,
+    };
+    ezb_err_t err = ezb_af_set_node_power_desc(&descriptor);
+    if (err == EZB_ERR_NONE) {
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Unable to set Zigbee power descriptor: 0x%04x", err);
+    return false;
+}
+
 static void add_basic_identity(ezb_af_ep_desc_t endpoint)
 {
     ezb_zcl_cluster_desc_t basic = ezb_af_endpoint_get_cluster_desc(
@@ -165,7 +201,7 @@ static ezb_af_ep_desc_t create_dc_electrical_endpoint(uint8_t endpoint_id, bool 
     if (include_basic) {
         ezb_zcl_basic_cluster_server_config_t basic_config = {
             .zcl_version = EZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
-            .power_source = EZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE,
+            .power_source = EZB_ZCL_BASIC_POWER_SOURCE_BATTERY,
         };
         ezb_zcl_cluster_desc_t basic =
             ezb_zcl_basic_create_cluster_desc(&basic_config, EZB_ZCL_CLUSTER_SERVER);
@@ -199,6 +235,19 @@ static void add_analog_input_cluster(
         analog, EZB_ZCL_ATTR_ANALOG_INPUT_APPLICATION_TYPE_ID, &encoded_application_type
     ));
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(endpoint, analog));
+}
+
+static void add_battery_power_cluster(ezb_af_ep_desc_t endpoint)
+{
+    uint8_t percentage_remaining = UINT8_MAX;
+    ezb_zcl_cluster_desc_t power_config =
+        ezb_zcl_power_config_create_cluster_desc(NULL, EZB_ZCL_CLUSTER_SERVER);
+    ESP_ERROR_CHECK(ezb_zcl_power_config_cluster_desc_add_attr(
+        power_config,
+        EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+        &percentage_remaining
+    ));
+    ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(endpoint, power_config));
 }
 
 static ezb_af_ep_desc_t create_analog_endpoint(
@@ -242,6 +291,7 @@ static void register_device(void)
     ));
 
     ezb_zha_temperature_sensor_config_t battery_config = EZB_ZHA_TEMPERATURE_SENSOR_CONFIG();
+    battery_config.basic_cfg.power_source = EZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
     battery_config.temp_meas_cfg.min_measured_value = -4000;
     battery_config.temp_meas_cfg.max_measured_value = 10000;
     ezb_af_ep_desc_t battery =
@@ -254,9 +304,11 @@ static void register_device(void)
         EZB_ZCL_ANALOG_INPUT_APPLICATION_TYPE_PERCENTAGE,
         0
     );
+    add_battery_power_cluster(battery);
     ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(device, battery));
 
     ezb_zha_temperature_sensor_config_t controller_config = EZB_ZHA_TEMPERATURE_SENSOR_CONFIG();
+    controller_config.basic_cfg.power_source = EZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
     controller_config.temp_meas_cfg.min_measured_value = -4000;
     controller_config.temp_meas_cfg.max_measured_value = 12500;
     ezb_af_ep_desc_t controller =
@@ -391,9 +443,18 @@ static bool update_telemetry(const epsolar_telemetry_t *telemetry)
         );
     }
     if (telemetry->valid & EPSOLAR_VALID_BATTERY_LEVEL) {
-        success &= set_analog_value(
+        uint8_t battery_percentage =
+            clamp_battery_percentage(telemetry->battery_level_percent);
+        uint8_t percentage_remaining = battery_percentage * 2U;
+        success &= set_attribute(
             EPSOLAR_BATTERY_ENDPOINT,
-            telemetry->battery_level_percent
+            EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+            EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+            &percentage_remaining
+        );
+        success &= set_analog_value(EPSOLAR_BATTERY_ENDPOINT, battery_percentage);
+        success &= set_battery_power_descriptor(
+            battery_power_source_level(battery_percentage)
         );
     }
     if (telemetry->valid & EPSOLAR_VALID_BATTERY_ELECTRICAL) {
@@ -575,6 +636,11 @@ static void zigbee_task(void *arg)
     };
 
     ESP_ERROR_CHECK(esp_zigbee_init(&config));
+    ESP_ERROR_CHECK(
+        set_battery_power_descriptor(EZB_AF_NODE_POWER_SOURCE_LEVEL_100_PERCENT)
+            ? ESP_OK
+            : ESP_FAIL
+    );
     ezb_nwk_set_rx_on_when_idle(false);
     ezb_aps_secur_enable_distributed_security(false);
     ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(EZB_RADIO_2P4GHZ_ALL_CHANNEL_MASK));
