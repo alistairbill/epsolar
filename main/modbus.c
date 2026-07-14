@@ -3,12 +3,10 @@
 #include <stddef.h>
 
 #include "driver/uart.h"
-#include "esp_check.h"
 #include "esp_modbus_master.h"
 
 #define MODBUS_RESPONSE_TIMEOUT_MS 500
 
-static const char *TAG = "epsolar_modbus";
 #define BLOCK_DESCRIPTOR(block_id, key, address, count)       \
     {                                                          \
         .cid = (block_id),                                     \
@@ -34,8 +32,12 @@ static const mb_parameter_descriptor_t register_blocks[] = {
 
 esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus)
 {
-    ESP_RETURN_ON_FALSE(modbus != NULL, ESP_ERR_INVALID_ARG, TAG, "Missing Modbus context");
-    ESP_RETURN_ON_FALSE(modbus->handle == NULL, ESP_ERR_INVALID_STATE, TAG, "Modbus already initialized");
+    if (modbus == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (modbus->handle != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     mb_communication_info_t communication = {
         .ser_opts = {
@@ -50,9 +52,12 @@ esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus)
         },
     };
 
-    ESP_RETURN_ON_ERROR(mbc_master_create_serial(&communication, &modbus->handle), TAG, "Creating Modbus master");
+    esp_err_t err = mbc_master_create_serial(&communication, &modbus->handle);
+    if (err != ESP_OK) {
+        return err;
+    }
 
-    esp_err_t err = uart_set_pin(
+    err = uart_set_pin(
         CONFIG_EPSOLAR_MODBUS_UART_PORT,
         CONFIG_EPSOLAR_MODBUS_TX_GPIO,
         CONFIG_EPSOLAR_MODBUS_RX_GPIO,
@@ -91,13 +96,12 @@ esp_err_t epsolar_modbus_read_block(
     uint16_t *registers
 )
 {
-    ESP_RETURN_ON_FALSE(modbus != NULL && modbus->handle != NULL, ESP_ERR_INVALID_STATE, TAG, "Modbus not initialized");
-    ESP_RETURN_ON_FALSE(
-        registers != NULL && block < EPSOLAR_MODBUS_BLOCK_COUNT,
-        ESP_ERR_INVALID_ARG,
-        TAG,
-        "Invalid register block"
-    );
+    if (modbus == NULL || modbus->handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (registers == NULL || (unsigned)block >= EPSOLAR_MODBUS_BLOCK_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     uint8_t parameter_type = 0;
     esp_err_t err = mbc_master_get_parameter(
@@ -106,11 +110,8 @@ esp_err_t epsolar_modbus_read_block(
         (uint8_t *)registers,
         &parameter_type
     );
-    ESP_RETURN_ON_FALSE(
-        err != ESP_OK || parameter_type == PARAM_TYPE_BIN,
-        ESP_ERR_INVALID_RESPONSE,
-        TAG,
-        "Unexpected Modbus parameter type"
-    );
+    if (err == ESP_OK && parameter_type != PARAM_TYPE_BIN) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     return err;
 }
