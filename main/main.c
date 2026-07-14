@@ -6,6 +6,9 @@
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#ifdef CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 #include "esp_zigbee.h"
 #include "ezbee/platform/radio.h"
 #include "ezbee/zha.h"
@@ -38,8 +41,23 @@
 static const char *TAG = "epsolar_zigbee";
 static bool telemetry_task_started;
 
+#ifdef CONFIG_PM_ENABLE
+static void configure_power_management(void)
+{
+    esp_pm_config_t config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .light_sleep_enable = true,
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&config));
+}
+#endif
+
 static void select_external_antenna(void)
 {
+    ESP_ERROR_CHECK(gpio_hold_dis(RF_SWITCH_POWER_GPIO));
+    ESP_ERROR_CHECK(gpio_hold_dis(RF_SWITCH_SELECT_GPIO));
+
     gpio_config_t config = {
         .pin_bit_mask =
             (1ULL << RF_SWITCH_POWER_GPIO) |
@@ -54,6 +72,8 @@ static void select_external_antenna(void)
     ESP_ERROR_CHECK(gpio_set_level(RF_SWITCH_POWER_GPIO, 0));
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_ERROR_CHECK(gpio_set_level(RF_SWITCH_SELECT_GPIO, 1));
+    ESP_ERROR_CHECK(gpio_hold_en(RF_SWITCH_POWER_GPIO));
+    ESP_ERROR_CHECK(gpio_hold_en(RF_SWITCH_SELECT_GPIO));
 }
 
 static int16_t clamp_zcl_measurement(int64_t value)
@@ -555,6 +575,7 @@ static void zigbee_task(void *arg)
     };
 
     ESP_ERROR_CHECK(esp_zigbee_init(&config));
+    ezb_nwk_set_rx_on_when_idle(false);
     ezb_aps_secur_enable_distributed_security(false);
     ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(EZB_RADIO_2P4GHZ_ALL_CHANNEL_MASK));
     ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
@@ -588,6 +609,9 @@ void app_main(void)
 {
     select_external_antenna();
     initialize_nvs();
+#ifdef CONFIG_PM_ENABLE
+    configure_power_management();
+#endif
     ESP_LOGI(TAG, "Starting ESP32-C6 EPSolar Zigbee sensor");
     ESP_ERROR_CHECK(
         xTaskCreate(zigbee_task, "zigbee_main", 6144, NULL, 5, NULL) == pdPASS
