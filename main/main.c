@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_zigbee.h"
@@ -16,6 +17,8 @@
 
 #define EPSOLAR_STORAGE_PARTITION "zb_storage"
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
+#define RF_SWITCH_POWER_GPIO GPIO_NUM_3
+#define RF_SWITCH_SELECT_GPIO GPIO_NUM_14
 
 #define EPSOLAR_PRIVATE_PROFILE_ID 0xc000
 #define EPSOLAR_DC_DEVICE_ID 0x0001
@@ -34,6 +37,24 @@
 
 static const char *TAG = "epsolar_zigbee";
 static bool telemetry_task_started;
+
+static void select_external_antenna(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask =
+            (1ULL << RF_SWITCH_POWER_GPIO) |
+            (1ULL << RF_SWITCH_SELECT_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+
+    ESP_ERROR_CHECK(gpio_set_level(RF_SWITCH_POWER_GPIO, 0));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_ERROR_CHECK(gpio_set_level(RF_SWITCH_SELECT_GPIO, 1));
+}
 
 static int16_t clamp_zcl_measurement(int64_t value)
 {
@@ -565,6 +586,7 @@ static void initialize_nvs(void)
 
 void app_main(void)
 {
+    select_external_antenna();
     initialize_nvs();
     ESP_LOGI(TAG, "Starting ESP32-C6 EPSolar Zigbee sensor");
     ESP_ERROR_CHECK(

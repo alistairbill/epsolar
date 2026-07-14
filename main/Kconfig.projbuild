@@ -18,12 +18,16 @@ config EPSOLAR_MODBUS_UART_PORT
 config EPSOLAR_MODBUS_TX_GPIO
     int "Modbus UART TX GPIO"
     range 0 30
-    default 5
+    default 16
+    help
+        XIAO D6, labelled TX.
 
 config EPSOLAR_MODBUS_RX_GPIO
     int "Modbus UART RX GPIO"
     range 0 30
-    default 4
+    default 17
+    help
+        XIAO D7, labelled RX.
 
 config EPSOLAR_MODBUS_BAUD_RATE
     int "Modbus baud rate"
