@@ -25,9 +25,6 @@
 #define RF_SWITCH_POWER_GPIO GPIO_NUM_3
 #define RF_SWITCH_SELECT_GPIO GPIO_NUM_14
 
-#define EPSOLAR_PRIVATE_PROFILE_ID 0xc000
-#define EPSOLAR_DC_DEVICE_ID 0x0001
-#define EPSOLAR_STATUS_DEVICE_ID 0x0002
 #define EPSOLAR_ARRAY_ENDPOINT 1
 #define EPSOLAR_BATTERY_ENDPOINT 2
 #define EPSOLAR_CONTROLLER_ENDPOINT 3
@@ -220,8 +217,8 @@ static ezb_af_ep_desc_t create_dc_electrical_endpoint(uint8_t endpoint_id, bool 
 {
     ezb_af_ep_config_t endpoint_config = {
         .ep_id = endpoint_id,
-        .app_profile_id = EPSOLAR_PRIVATE_PROFILE_ID,
-        .app_device_id = EPSOLAR_DC_DEVICE_ID,
+        .app_profile_id = EZB_AF_HA_PROFILE_ID,
+        .app_device_id = EZB_ZHA_CONSUMPTION_AWARENESS_DEVICE_ID,
         .app_device_version = 1,
     };
     ezb_af_ep_desc_t endpoint = ezb_af_create_endpoint_desc(&endpoint_config);
@@ -288,8 +285,8 @@ static ezb_af_ep_desc_t create_analog_endpoint(
 {
     ezb_af_ep_config_t endpoint_config = {
         .ep_id = endpoint_id,
-        .app_profile_id = EPSOLAR_PRIVATE_PROFILE_ID,
-        .app_device_id = EPSOLAR_STATUS_DEVICE_ID,
+        .app_profile_id = EZB_AF_HA_PROFILE_ID,
+        .app_device_id = EZB_ZHA_SIMPLE_SENSOR_DEVICE_ID,
         .app_device_version = 1,
     };
     ezb_af_ep_desc_t endpoint = ezb_af_create_endpoint_desc(&endpoint_config);
