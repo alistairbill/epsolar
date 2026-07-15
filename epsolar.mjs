@@ -184,25 +184,16 @@ async function configureElectrical(endpoint, coordinatorEndpoint, includePower) 
         'dcVoltage',
         'dcCurrent',
     ];
-    const reportings = [
-        {attribute: 'dcVoltage', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 10},
-        {attribute: 'dcCurrent', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 10},
-    ];
 
     if (includePower) {
         attributes.push('dcPowerMultiplier', 'dcPowerDivisor', 'dcPower');
-        reportings.push({attribute: 'dcPower', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 1});
     }
 
-    await endpoint.configureReporting('haElectricalMeasurement', reportings);
     await endpoint.read('haElectricalMeasurement', attributes);
 }
 
 async function configureAnalogInput(endpoint, coordinatorEndpoint) {
     await reporting.bind(endpoint, coordinatorEndpoint, ['genAnalogInput']);
-    await endpoint.configureReporting('genAnalogInput', [
-        {attribute: 'presentValue', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 1},
-    ]);
     await endpoint.read('genAnalogInput', ['presentValue']);
 }
 
@@ -254,7 +245,6 @@ const definition = {
                 throw new Error(`Missing temperature endpoint ${id}`);
             }
             await reporting.bind(endpoint, coordinatorEndpoint, ['msTemperatureMeasurement']);
-            await reporting.temperature(endpoint, {min: 10, max: 300, change: 10});
             await endpoint.read('msTemperatureMeasurement', ['measuredValue']);
         }
 
@@ -263,14 +253,6 @@ const definition = {
             throw new Error('Missing battery endpoint 2');
         }
         await reporting.bind(batteryEndpoint, coordinatorEndpoint, ['genPowerCfg']);
-        await batteryEndpoint.configureReporting('genPowerCfg', [
-            {
-                attribute: 'batteryPercentageRemaining',
-                minimumReportInterval: 10,
-                maximumReportInterval: 300,
-                reportableChange: 2,
-            },
-        ]);
         await batteryEndpoint.read('genPowerCfg', ['batteryPercentageRemaining']);
 
         for (const id of Object.keys(analogInputs)) {
