@@ -20,6 +20,8 @@
 
 #define EPSOLAR_STORAGE_PARTITION "zb_storage"
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
+#define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
+#define EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS 15000
 #define RF_SWITCH_POWER_GPIO GPIO_NUM_3
 #define RF_SWITCH_SELECT_GPIO GPIO_NUM_14
 
@@ -42,14 +44,41 @@ static const char *TAG = "epsolar_zigbee";
 static bool telemetry_task_started;
 
 #ifdef CONFIG_PM_ENABLE
-static void configure_power_management(void)
+static bool light_sleep_task_started;
+
+static void configure_power_management(bool light_sleep_enable)
 {
     esp_pm_config_t config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .light_sleep_enable = true,
+        .light_sleep_enable = light_sleep_enable,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&config));
+}
+
+static void light_sleep_enable_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS));
+    configure_power_management(true);
+    ESP_LOGI(TAG, "Automatic light sleep enabled");
+    vTaskDelete(NULL);
+}
+
+static void schedule_light_sleep_enable(void)
+{
+    if (light_sleep_task_started) {
+        return;
+    }
+    BaseType_t created = xTaskCreate(
+        light_sleep_enable_task,
+        "light_sleep",
+        2048,
+        NULL,
+        3,
+        NULL
+    );
+    ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    light_sleep_task_started = true;
 }
 #endif
 
@@ -579,12 +608,19 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             schedule_commissioning_retry(EZB_BDB_MODE_INITIALIZATION);
             break;
         }
-        start_telemetry_task();
         if (ezb_bdb_is_factory_new()) {
             ESP_LOGI(TAG, "Starting Zigbee network steering");
-            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+            ezb_err_t err = ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+            if (err != EZB_ERR_NONE) {
+                ESP_LOGE(TAG, "Unable to start Zigbee network steering: 0x%04x", err);
+                schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
+            }
         } else {
             ESP_LOGI(TAG, "Zigbee device resumed its saved network");
+#ifdef CONFIG_PM_ENABLE
+            schedule_light_sleep_enable();
+#endif
+            start_telemetry_task();
         }
         break;
     }
@@ -602,6 +638,10 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
                 ezb_nwk_get_current_channel(),
                 ezb_nwk_get_short_address()
             );
+#ifdef CONFIG_PM_ENABLE
+            schedule_light_sleep_enable();
+#endif
+            start_telemetry_task();
         } else {
             ESP_LOGW(TAG, "Zigbee network steering failed: 0x%02x", status);
             schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
@@ -643,6 +683,7 @@ static void zigbee_task(void *arg)
     );
     ezb_nwk_set_rx_on_when_idle(false);
     ezb_aps_secur_enable_distributed_security(false);
+    ezb_nwk_set_min_join_lqi(EPSOLAR_ZIGBEE_MIN_JOIN_LQI);
     ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(EZB_RADIO_2P4GHZ_ALL_CHANNEL_MASK));
     ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
     register_device();
@@ -676,7 +717,7 @@ void app_main(void)
     select_external_antenna();
     initialize_nvs();
 #ifdef CONFIG_PM_ENABLE
-    configure_power_management();
+    configure_power_management(false);
 #endif
     ESP_LOGI(TAG, "Starting ESP32-C6 EPSolar Zigbee sensor");
     ESP_ERROR_CHECK(
