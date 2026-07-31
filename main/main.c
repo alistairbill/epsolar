@@ -281,6 +281,28 @@ static void add_basic_identity(ezb_af_ep_desc_t endpoint)
     ));
 }
 
+/* Only a handful of standard attributes ship with EZB_ZCL_ATTR_ACCESS_REPORTING
+ * (temperature MeasuredValue is one; the DC electrical, analog input and
+ * battery attributes are not). The stack allocates a reporting slot per
+ * reportable attribute while the data model is registered, so the flag has to
+ * be set here, on the cluster descriptor, before ezb_af_device_desc_register().
+ * Without a slot, Configure Reporting from the coordinator and
+ * ezb_zcl_report_attr_cmd_req() from us both fail with EZB_ERR_FAIL. */
+static void mark_reportable(ezb_zcl_cluster_desc_t cluster, uint16_t attribute)
+{
+    ezb_zcl_attr_desc_t attr =
+        ezb_zcl_cluster_get_attr_desc(cluster, attribute, EZB_ZCL_STD_MANUF_CODE);
+    ESP_ERROR_CHECK(attr == EZB_INVALID_ZCL_ATTR_DESC ? ESP_ERR_NOT_FOUND : ESP_OK);
+    if (ezb_zcl_attr_is_reportable(attr)) {
+        return;
+    }
+    ezb_err_t err = ezb_zcl_attr_desc_set_access(
+        attr,
+        ezb_zcl_attr_desc_get_access(attr) | EZB_ZCL_ATTR_ACCESS_REPORTING
+    );
+    ESP_ERROR_CHECK(err == EZB_ERR_NONE ? ESP_OK : ESP_FAIL);
+}
+
 static void add_dc_electrical_cluster(ezb_af_ep_desc_t endpoint, bool include_power)
 {
     ezb_zcl_electrical_measurement_cluster_server_config_t electrical_config = {
@@ -314,6 +336,8 @@ static void add_dc_electrical_cluster(ezb_af_ep_desc_t endpoint, bool include_po
     ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
         electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_DIVISOR_ID, &centi_divisor
     ));
+    mark_reportable(electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID);
+    mark_reportable(electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID);
     if (include_power) {
         ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
             electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID, &unmeasured
@@ -324,6 +348,7 @@ static void add_dc_electrical_cluster(ezb_af_ep_desc_t endpoint, bool include_po
         ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
             electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_DIVISOR_ID, &deci_divisor
         ));
+        mark_reportable(electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID);
     }
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(endpoint, electrical));
 }
@@ -375,6 +400,7 @@ static void add_analog_input_cluster(
     ESP_ERROR_CHECK(ezb_zcl_analog_input_cluster_desc_add_attr(
         analog, EZB_ZCL_ATTR_ANALOG_INPUT_APPLICATION_TYPE_ID, &encoded_application_type
     ));
+    mark_reportable(analog, EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID);
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(endpoint, analog));
 }
 
@@ -388,6 +414,7 @@ static void add_battery_power_cluster(ezb_af_ep_desc_t endpoint)
         EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
         &percentage_remaining
     ));
+    mark_reportable(power_config, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID);
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(endpoint, power_config));
 }
 
