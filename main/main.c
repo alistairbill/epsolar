@@ -23,6 +23,8 @@
 #include "solar.h"
 
 #define EPSOLAR_STORAGE_PARTITION "zb_storage"
+#define EPSOLAR_REPORT_MIN_INTERVAL_S 30
+#define EPSOLAR_REPORT_MAX_INTERVAL_S 180
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
 #define EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS 120000
@@ -65,6 +67,8 @@ typedef struct {
     uint32_t cycles;
     uint32_t modbus_failures;
     uint32_t publish_failures;
+    uint32_t report_failures;
+    uint32_t report_confirms;
     uint32_t last_publish_uptime_s;
     uint32_t last_cycle_uptime_s;
     bool light_sleep_enabled;
@@ -132,6 +136,7 @@ static void report_boot_diagnostics(void)
             TAG,
             "Boot %" PRIu32 " (reset reason %d); previous run (%s): cycles=%" PRIu32
             " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
+            " report_confirms=%" PRIu32 " report_failures=%" PRIu32
             " last_cycle=%" PRIu32 "s last_publish=%" PRIu32 "s light_sleep=%d",
             previous.boots + 1,
             reason,
@@ -139,6 +144,8 @@ static void report_boot_diagnostics(void)
             previous.cycles,
             previous.modbus_failures,
             previous.publish_failures,
+            previous.report_confirms,
+            previous.report_failures,
             previous.last_cycle_uptime_s,
             previous.last_publish_uptime_s,
             previous.light_sleep_enabled
@@ -471,6 +478,222 @@ static void register_device(void)
     ESP_ERROR_CHECK(ezb_af_device_desc_register(device));
 }
 
+/* Attributes that zigbee2mqtt binds and expects reports for. The stack only
+ * emits periodic reports when a reporting configuration survives in NVS, so
+ * every cycle also pushes an explicit Report Attributes command; that is what
+ * the espressif sensor examples do and it is independent of the coordinator's
+ * reporting setup. */
+static const struct {
+    uint8_t endpoint;
+    uint16_t cluster;
+    uint16_t attribute;
+} reported_attributes[] = {
+    {EPSOLAR_ARRAY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID},
+    {EPSOLAR_ARRAY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID},
+    {EPSOLAR_ARRAY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID},
+    {EPSOLAR_LOAD_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID},
+    {EPSOLAR_LOAD_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID},
+    {EPSOLAR_LOAD_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID},
+    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID},
+    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID},
+    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_TEMPERATURE_MEASUREMENT,
+     EZB_ZCL_ATTR_TEMPERATURE_MEASUREMENT_MEASURED_VALUE_ID},
+    {EPSOLAR_CONTROLLER_ENDPOINT, EZB_ZCL_CLUSTER_ID_TEMPERATURE_MEASUREMENT,
+     EZB_ZCL_ATTR_TEMPERATURE_MEASUREMENT_MEASURED_VALUE_ID},
+    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+     EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID},
+    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
+    {EPSOLAR_BATTERY_STATUS_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
+    {EPSOLAR_CHARGING_STATUS_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
+    {EPSOLAR_DISCHARGING_STATUS_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
+};
+
+#define EPSOLAR_REPORTED_ATTRIBUTE_COUNT \
+    (sizeof(reported_attributes) / sizeof(reported_attributes[0]))
+
+static void report_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
+{
+    (void)user_ctx;
+    if (cnf->status == 0) {
+        s_diag.report_confirms++;
+        return;
+    }
+    s_diag.report_failures++;
+    ESP_LOGW(
+        TAG,
+        "Report transmission failed: endpoint=%u cluster=0x%04x status=0x%02x",
+        cnf->src_ep,
+        cnf->cluster_id,
+        cnf->status
+    );
+}
+
+/* Caller holds the Zigbee stack lock. */
+static void report_attributes(void)
+{
+    for (size_t i = 0; i < EPSOLAR_REPORTED_ATTRIBUTE_COUNT; ++i) {
+        ezb_zcl_report_attr_cmd_t command = {
+            .cmd_ctrl = {
+                .dst_addr = {
+                    .addr_mode = EZB_ADDR_MODE_SHORT,
+                    .u = {.short_addr = 0x0000},
+                },
+                .dst_ep = 1,
+                .src_ep = reported_attributes[i].endpoint,
+                .cluster_id = reported_attributes[i].cluster,
+                .manuf_code = EZB_ZCL_STD_MANUF_CODE,
+                .fc = {.direction = 1, .dis_default_rsp = 1},
+                .cnf_ctx = {.cb = report_confirm},
+            },
+            .payload = {.attr_id = reported_attributes[i].attribute},
+        };
+        ezb_err_t err = ezb_zcl_report_attr_cmd_req(&command);
+        if (err != EZB_ERR_NONE) {
+            s_diag.report_failures++;
+            ESP_LOGW(
+                TAG,
+                "Unable to report endpoint=%u cluster=0x%04x attribute=0x%04x: 0x%04x",
+                reported_attributes[i].endpoint,
+                reported_attributes[i].cluster,
+                reported_attributes[i].attribute,
+                err
+            );
+        }
+    }
+}
+
+/* Caller holds the Zigbee stack lock.
+ *
+ * zigbee2mqtt asks for min 10 s / max 300 s, but that configuration only
+ * produces on-change reports here: the max-interval heartbeat never fires, so
+ * a static solar array goes silent for as long as nothing moves. Re-arm every
+ * reportable attribute locally with a zero reportable change, which makes the
+ * stack emit on every telemetry cycle it sees a write, and re-assert the
+ * intervals independently of whatever the coordinator configured. */
+static void configure_local_reporting(void)
+{
+    uint32_t present = 0;
+    uint32_t armed = 0;
+    for (size_t i = 0; i < EPSOLAR_REPORTED_ATTRIBUTE_COUNT; ++i) {
+        ezb_zcl_reporting_info_t info = ezb_zcl_reporting_info_find(
+            reported_attributes[i].endpoint,
+            reported_attributes[i].cluster,
+            EZB_ZCL_CLUSTER_SERVER,
+            reported_attributes[i].attribute,
+            EZB_ZCL_STD_MANUF_CODE
+        );
+        if (info == EZB_ZCL_INVALID_REPORTING_INFO) {
+            continue;
+        }
+        present |= 1U << i;
+
+        ezb_zcl_attr_variable_t delta = {0};
+        ezb_err_t err = ezb_zcl_reporting_info_update(
+            info,
+            EPSOLAR_REPORT_MIN_INTERVAL_S,
+            EPSOLAR_REPORT_MAX_INTERVAL_S,
+            &delta
+        );
+        if (err != EZB_ERR_NONE) {
+            ESP_LOGW(
+                TAG,
+                "Unable to arm reporting for endpoint=%u cluster=0x%04x attribute=0x%04x: 0x%04x",
+                reported_attributes[i].endpoint,
+                reported_attributes[i].cluster,
+                reported_attributes[i].attribute,
+                err
+            );
+            continue;
+        }
+        ezb_zcl_reporting_start_attr_report(info);
+        armed |= 1U << i;
+    }
+    ESP_LOGW(
+        TAG,
+        "Reporting records present for %d/%d attributes (mask 0x%05" PRIx32 "); "
+        "armed %d at %us/%us with zero reportable change",
+        __builtin_popcount(present),
+        (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT,
+        present,
+        __builtin_popcount(armed),
+        EPSOLAR_REPORT_MIN_INTERVAL_S,
+        EPSOLAR_REPORT_MAX_INTERVAL_S
+    );
+}
+
+/* Caller runs before esp_zigbee_start(): the stack derives its reporting table
+ * from the attribute access flags, and several standard attributes ship
+ * read-only. Without EZB_ZCL_ATTR_ACCESS_REPORTING there is no reporting
+ * record, so Configure Reporting from the coordinator and Report Attributes
+ * from us both fail and the device stays silent forever. */
+static void enable_reporting_access(void)
+{
+    uint32_t reportable = 0;
+    uint32_t patched = 0;
+    uint32_t missing = 0;
+    for (size_t i = 0; i < EPSOLAR_REPORTED_ATTRIBUTE_COUNT; ++i) {
+        ezb_zcl_attr_desc_t attr = ezb_zcl_get_attr_desc(
+            reported_attributes[i].endpoint,
+            reported_attributes[i].cluster,
+            EZB_ZCL_CLUSTER_SERVER,
+            reported_attributes[i].attribute,
+            EZB_ZCL_STD_MANUF_CODE
+        );
+        if (attr == EZB_INVALID_ZCL_ATTR_DESC) {
+            missing++;
+            ESP_LOGE(
+                TAG,
+                "Missing attribute descriptor: endpoint=%u cluster=0x%04x attribute=0x%04x",
+                reported_attributes[i].endpoint,
+                reported_attributes[i].cluster,
+                reported_attributes[i].attribute
+            );
+            continue;
+        }
+        if (ezb_zcl_attr_is_reportable(attr)) {
+            reportable++;
+            continue;
+        }
+        ezb_err_t err = ezb_zcl_attr_desc_set_access(
+            attr,
+            ezb_zcl_attr_desc_get_access(attr) | EZB_ZCL_ATTR_ACCESS_REPORTING
+        );
+        if (err != EZB_ERR_NONE) {
+            ESP_LOGE(
+                TAG,
+                "Unable to make endpoint=%u cluster=0x%04x attribute=0x%04x reportable: 0x%04x",
+                reported_attributes[i].endpoint,
+                reported_attributes[i].cluster,
+                reported_attributes[i].attribute,
+                err
+            );
+            continue;
+        }
+        patched++;
+    }
+    ESP_LOGW(
+        TAG,
+        "Reporting access: %" PRIu32 " already reportable, %" PRIu32 " patched, %" PRIu32
+        " missing, of %d",
+        reportable,
+        patched,
+        missing,
+        (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT
+    );
+}
+
 static bool set_attribute(uint8_t endpoint, uint16_t cluster, uint16_t attribute, void *value)
 {
     ezb_zcl_status_t status = ezb_zcl_set_attr_value(
@@ -627,6 +850,13 @@ static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
         );
     }
 
+    static bool reporting_configured;
+    if (!reporting_configured) {
+        configure_local_reporting();
+        reporting_configured = true;
+    }
+    report_attributes();
+
     esp_zigbee_lock_release();
     return success;
 }
@@ -671,6 +901,7 @@ static void telemetry_task(void *arg)
             TAG,
             "cycle=%" PRIu32 " uptime=%" PRIu32 "s valid=0x%02" PRIx32
             " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
+            " report_confirms=%" PRIu32 " report_failures=%" PRIu32
             " last_publish=%" PRIu32 "s joined=%d addr=0x%04x heap=%" PRIu32
             " min_heap=%" PRIu32 " light_sleep=%d",
             s_diag.cycles,
@@ -678,6 +909,8 @@ static void telemetry_task(void *arg)
             err == ESP_OK ? telemetry.valid : 0U,
             s_diag.modbus_failures,
             s_diag.publish_failures,
+            s_diag.report_confirms,
+            s_diag.report_failures,
             s_diag.last_publish_uptime_s,
             joined,
             short_address,
@@ -836,6 +1069,7 @@ static void zigbee_task(void *arg)
     ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(EZB_RADIO_2P4GHZ_ALL_CHANNEL_MASK));
     ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
     register_device();
+    enable_reporting_access();
     ESP_ERROR_CHECK(esp_zigbee_start(false));
     esp_zigbee_launch_mainloop();
 
