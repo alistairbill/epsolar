@@ -25,6 +25,7 @@
 #define EPSOLAR_STORAGE_PARTITION "zb_storage"
 #define EPSOLAR_REPORT_MIN_INTERVAL_S 30
 #define EPSOLAR_REPORT_MAX_INTERVAL_S 180
+#define EPSOLAR_REPORT_SPACING_MS 250
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
 #define EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS 120000
@@ -567,9 +568,17 @@ static void report_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
     );
 }
 
-/* Caller holds the Zigbee stack lock. */
+/* Acquires the Zigbee stack lock per frame; the caller MUST NOT hold it.
+ *
+ * Reports are submitted one at a time with the lock released in between. The
+ * stack takes an out-buffer per outgoing frame from a small fixed pool, and a
+ * tight 15-frame loop drains it: the first couple of requests are accepted and
+ * every later one fails with the generic EZB_ERR_FAIL. Pacing keeps at most one
+ * report in flight and lets the radio drain the queue between frames. */
 static void report_attributes(void)
 {
+    uint32_t submitted = 0;
+    uint32_t failed = 0;
     for (size_t i = 0; i < EPSOLAR_REPORTED_ATTRIBUTE_COUNT; ++i) {
         ezb_zcl_report_attr_cmd_t command = {
             .cmd_ctrl = {
@@ -586,18 +595,31 @@ static void report_attributes(void)
             },
             .payload = {.attr_id = reported_attributes[i].attribute},
         };
+
+        esp_zigbee_lock_acquire(portMAX_DELAY);
         ezb_err_t err = ezb_zcl_report_attr_cmd_req(&command);
-        if (err != EZB_ERR_NONE) {
+        esp_zigbee_lock_release();
+
+        if (err == EZB_ERR_NONE) {
+            submitted |= 1U << i;
+        } else {
+            failed |= 1U << i;
             s_diag.report_failures++;
-            ESP_LOGW(
-                TAG,
-                "Unable to report endpoint=%u cluster=0x%04x attribute=0x%04x: 0x%04x",
-                reported_attributes[i].endpoint,
-                reported_attributes[i].cluster,
-                reported_attributes[i].attribute,
-                err
-            );
         }
+        vTaskDelay(pdMS_TO_TICKS(EPSOLAR_REPORT_SPACING_MS));
+    }
+
+    if (failed != 0) {
+        ESP_LOGW(
+            TAG,
+            "Reports submitted mask 0x%05" PRIx32 ", rejected mask 0x%05" PRIx32
+            " (first rejection: endpoint=%u cluster=0x%04x attribute=0x%04x)",
+            submitted,
+            failed,
+            reported_attributes[__builtin_ctz(failed)].endpoint,
+            reported_attributes[__builtin_ctz(failed)].cluster,
+            reported_attributes[__builtin_ctz(failed)].attribute
+        );
     }
 }
 
@@ -882,9 +904,11 @@ static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
         configure_local_reporting();
         reporting_configured = true;
     }
-    report_attributes();
 
     esp_zigbee_lock_release();
+
+    /* Takes the lock itself, once per frame. */
+    report_attributes();
     return success;
 }
 
