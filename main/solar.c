@@ -22,10 +22,6 @@ static bool read_registers(
 
 esp_err_t epsolar_read_telemetry(epsolar_modbus_t *modbus, epsolar_telemetry_t *telemetry)
 {
-    if (modbus == NULL || telemetry == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
     memset(telemetry, 0, sizeof(*telemetry));
     uint16_t registers[4];
 

@@ -4,6 +4,10 @@ import * as reporting from 'zigbee-herdsman-converters/lib/reporting';
 const e = exposes.presets;
 const ea = exposes.access;
 
+// ZCL "invalid measurement" sentinel for int16 attributes; reported until the
+// device's first successful Modbus poll.
+const INVALID_INT16 = -32768;
+
 const batteryVoltageStatuses = {
     0: 'normal',
     1: 'over_voltage',
@@ -105,14 +109,15 @@ const fromElectricalMeasurement = {
         }
 
         const result = {};
-        if (msg.data.dcVoltage !== undefined) {
+        if (msg.data.dcVoltage !== undefined && msg.data.dcVoltage !== INVALID_INT16) {
             result[`${endpoint.prefix}_voltage`] = msg.data.dcVoltage / 100;
         }
-        if (msg.data.dcCurrent !== undefined) {
+        if (msg.data.dcCurrent !== undefined && msg.data.dcCurrent !== INVALID_INT16) {
             result[`${endpoint.prefix}_current`] = msg.data.dcCurrent / 100;
         }
-        if (endpoint.power && msg.data.dcPower !== undefined) {
-            result[`${endpoint.prefix}_power`] = msg.data.dcPower / 100;
+        // Power is reported in deciwatts: an int16 with divisor 100 would cap at 327 W.
+        if (endpoint.power && msg.data.dcPower !== undefined && msg.data.dcPower !== INVALID_INT16) {
+            result[`${endpoint.prefix}_power`] = msg.data.dcPower / 10;
         }
         return result;
     },
@@ -137,7 +142,7 @@ const fromAnalogInput = {
     convert: (model, msg) => {
         const input = analogInputs[msg.endpoint.ID];
         const value = msg.data.presentValue;
-        if (!input || value === undefined) {
+        if (!input || value === undefined || Number.isNaN(value)) {
             return;
         }
         if (input.decode) {

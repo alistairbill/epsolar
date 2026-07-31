@@ -1,11 +1,15 @@
 #include <inttypes.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "driver/gpio.h"
 #include "esp_check.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #ifdef CONFIG_PM_ENABLE
 #include "esp_pm.h"
 #endif
@@ -21,7 +25,7 @@
 #define EPSOLAR_STORAGE_PARTITION "zb_storage"
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
-#define EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS 15000
+#define EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS 120000
 #define RF_SWITCH_POWER_GPIO GPIO_NUM_3
 #define RF_SWITCH_SELECT_GPIO GPIO_NUM_14
 
@@ -37,12 +41,118 @@
 #define EPSOLAR_MANUFACTURER_NAME "\x09" "DIY Solar"
 #define EPSOLAR_MODEL_IDENTIFIER "\x0e" "EPSolar Zigbee"
 
+/* ZCL temperature MeasuredValue bounds, in hundredths of a degree Celsius */
+#define EPSOLAR_TEMPERATURE_MIN_cC (-4000)
+#define EPSOLAR_BATTERY_TEMPERATURE_MAX_cC 10000
+#define EPSOLAR_CONTROLLER_TEMPERATURE_MAX_cC 12500
+
 static const char *TAG = "epsolar_zigbee";
 static bool telemetry_task_started;
 
-#ifdef CONFIG_PM_ENABLE
-static bool light_sleep_task_started;
+/* Live counters sit in RTC RAM (survives light sleep, software resets and
+ * panics) and are mirrored into NVS every EPSOLAR_DIAG_SAVE_CYCLES cycles so
+ * they also survive an EN-pin reset or a power cycle, which drop RTC RAM.
+ * This is the only readout channel once light sleep has killed USB Serial
+ * JTAG: let it fail, reset the board, read the boot line. */
+#define EPSOLAR_DIAG_MAGIC 0x45505331U /* "EPS1" */
+#define EPSOLAR_DIAG_NAMESPACE "epsolar"
+#define EPSOLAR_DIAG_KEY "diag"
+#define EPSOLAR_DIAG_SAVE_CYCLES 10
 
+typedef struct {
+    uint32_t magic;
+    uint32_t boots;
+    uint32_t cycles;
+    uint32_t modbus_failures;
+    uint32_t publish_failures;
+    uint32_t last_publish_uptime_s;
+    uint32_t last_cycle_uptime_s;
+    bool light_sleep_enabled;
+} epsolar_diag_t;
+
+static RTC_NOINIT_ATTR epsolar_diag_t s_diag;
+
+static uint32_t uptime_seconds(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000000);
+}
+
+static void save_diagnostics(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(EPSOLAR_DIAG_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to open diagnostics storage: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_blob(nvs, EPSOLAR_DIAG_KEY, &s_diag, sizeof(s_diag));
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to store diagnostics: %s", esp_err_to_name(err));
+    }
+    nvs_close(nvs);
+}
+
+static bool load_diagnostics(epsolar_diag_t *diag)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(EPSOLAR_DIAG_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+    size_t length = sizeof(*diag);
+    bool loaded = nvs_get_blob(nvs, EPSOLAR_DIAG_KEY, diag, &length) == ESP_OK
+        && length == sizeof(*diag)
+        && diag->magic == EPSOLAR_DIAG_MAGIC;
+    nvs_close(nvs);
+    return loaded;
+}
+
+static void report_boot_diagnostics(void)
+{
+    esp_reset_reason_t reason = esp_reset_reason();
+    epsolar_diag_t previous;
+    const char *source;
+
+    if (s_diag.magic == EPSOLAR_DIAG_MAGIC) {
+        previous = s_diag;
+        source = "RTC RAM";
+    } else if (load_diagnostics(&previous)) {
+        source = "NVS, up to 10 cycles stale";
+    } else {
+        previous = (epsolar_diag_t){0};
+        source = NULL;
+    }
+
+    if (source == NULL) {
+        ESP_LOGI(TAG, "Boot 1 (reset reason %d); no retained diagnostics", reason);
+    } else {
+        ESP_LOGW(
+            TAG,
+            "Boot %" PRIu32 " (reset reason %d); previous run (%s): cycles=%" PRIu32
+            " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
+            " last_cycle=%" PRIu32 "s last_publish=%" PRIu32 "s light_sleep=%d",
+            previous.boots + 1,
+            reason,
+            source,
+            previous.cycles,
+            previous.modbus_failures,
+            previous.publish_failures,
+            previous.last_cycle_uptime_s,
+            previous.last_publish_uptime_s,
+            previous.light_sleep_enabled
+        );
+    }
+
+    s_diag = (epsolar_diag_t){
+        .magic = EPSOLAR_DIAG_MAGIC,
+        .boots = previous.boots + 1,
+    };
+    save_diagnostics();
+}
+
+#ifdef CONFIG_PM_ENABLE
 static void configure_power_management(bool light_sleep_enable)
 {
     esp_pm_config_t config = {
@@ -57,25 +167,21 @@ static void light_sleep_enable_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS));
     configure_power_management(true);
+    s_diag.light_sleep_enabled = true;
+    save_diagnostics();
     ESP_LOGI(TAG, "Automatic light sleep enabled");
     vTaskDelete(NULL);
 }
 
 static void schedule_light_sleep_enable(void)
 {
-    if (light_sleep_task_started) {
+    static bool scheduled;
+    if (scheduled) {
         return;
     }
-    BaseType_t created = xTaskCreate(
-        light_sleep_enable_task,
-        "light_sleep",
-        2048,
-        NULL,
-        3,
-        NULL
-    );
+    BaseType_t created = xTaskCreate(light_sleep_enable_task, "light_sleep", 2048, NULL, 3, NULL);
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-    light_sleep_task_started = true;
+    scheduled = true;
 }
 #endif
 
@@ -176,16 +282,18 @@ static void add_dc_electrical_cluster(ezb_af_ep_desc_t endpoint, bool include_po
     ezb_zcl_cluster_desc_t electrical =
         ezb_zcl_electrical_measurement_create_cluster_desc(&electrical_config, EZB_ZCL_CLUSTER_SERVER);
 
-    int16_t voltage = 0;
-    int16_t current = 0;
-    int16_t power = 0;
+    /* INT16_MIN is the ZCL "invalid" sentinel: readings stay unknown until the
+     * first Modbus poll succeeds. Power uses divisor 10 (deciwatts) because
+     * divisor 100 would clamp the int16 attribute at 327 W. */
+    int16_t unmeasured = INT16_MIN;
     uint16_t multiplier = 1;
     uint16_t centi_divisor = 100;
+    uint16_t deci_divisor = 10;
     ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
-        electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID, &voltage
+        electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID, &unmeasured
     ));
     ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
-        electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID, &current
+        electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID, &unmeasured
     ));
     ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
         electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_MULTIPLIER_ID, &multiplier
@@ -201,13 +309,13 @@ static void add_dc_electrical_cluster(ezb_af_ep_desc_t endpoint, bool include_po
     ));
     if (include_power) {
         ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
-            electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID, &power
+            electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID, &unmeasured
         ));
         ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
             electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_MULTIPLIER_ID, &multiplier
         ));
         ESP_ERROR_CHECK(ezb_zcl_electrical_measurement_cluster_desc_add_attr(
-            electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_DIVISOR_ID, &centi_divisor
+            electrical, EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_DIVISOR_ID, &deci_divisor
         ));
     }
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(endpoint, electrical));
@@ -248,7 +356,7 @@ static void add_analog_input_cluster(
 {
     ezb_zcl_analog_input_cluster_server_config_t analog_config = {
         .out_of_service = false,
-        .present_value = 0,
+        .present_value = NAN,
         .status_flags = 0,
     };
     ezb_zcl_cluster_desc_t analog =
@@ -274,6 +382,17 @@ static void add_battery_power_cluster(ezb_af_ep_desc_t endpoint)
         &percentage_remaining
     ));
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(endpoint, power_config));
+}
+
+static ezb_af_ep_desc_t create_temperature_endpoint(uint8_t endpoint_id, int16_t max_measured_value)
+{
+    ezb_zha_temperature_sensor_config_t config = EZB_ZHA_TEMPERATURE_SENSOR_CONFIG();
+    config.basic_cfg.power_source = EZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
+    config.temp_meas_cfg.min_measured_value = EPSOLAR_TEMPERATURE_MIN_cC;
+    config.temp_meas_cfg.max_measured_value = max_measured_value;
+    ezb_af_ep_desc_t endpoint = ezb_zha_create_temperature_sensor(endpoint_id, &config);
+    add_basic_identity(endpoint);
+    return endpoint;
 }
 
 static ezb_af_ep_desc_t create_analog_endpoint(
@@ -316,13 +435,9 @@ static void register_device(void)
         device, create_dc_electrical_endpoint(EPSOLAR_ARRAY_ENDPOINT, true)
     ));
 
-    ezb_zha_temperature_sensor_config_t battery_config = EZB_ZHA_TEMPERATURE_SENSOR_CONFIG();
-    battery_config.basic_cfg.power_source = EZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
-    battery_config.temp_meas_cfg.min_measured_value = -4000;
-    battery_config.temp_meas_cfg.max_measured_value = 10000;
-    ezb_af_ep_desc_t battery =
-        ezb_zha_create_temperature_sensor(EPSOLAR_BATTERY_ENDPOINT, &battery_config);
-    add_basic_identity(battery);
+    ezb_af_ep_desc_t battery = create_temperature_endpoint(
+        EPSOLAR_BATTERY_ENDPOINT, EPSOLAR_BATTERY_TEMPERATURE_MAX_cC
+    );
     add_dc_electrical_cluster(battery, false);
     add_analog_input_cluster(
         battery,
@@ -333,14 +448,10 @@ static void register_device(void)
     add_battery_power_cluster(battery);
     ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(device, battery));
 
-    ezb_zha_temperature_sensor_config_t controller_config = EZB_ZHA_TEMPERATURE_SENSOR_CONFIG();
-    controller_config.basic_cfg.power_source = EZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
-    controller_config.temp_meas_cfg.min_measured_value = -4000;
-    controller_config.temp_meas_cfg.max_measured_value = 12500;
-    ezb_af_ep_desc_t controller =
-        ezb_zha_create_temperature_sensor(EPSOLAR_CONTROLLER_ENDPOINT, &controller_config);
-    add_basic_identity(controller);
-    ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(device, controller));
+    ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(
+        device,
+        create_temperature_endpoint(EPSOLAR_CONTROLLER_ENDPOINT, EPSOLAR_CONTROLLER_TEMPERATURE_MAX_cC)
+    ));
 
     ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(
         device, create_dc_electrical_endpoint(EPSOLAR_LOAD_ENDPOINT, false)
@@ -396,8 +507,7 @@ static bool set_analog_value(uint8_t endpoint, float value)
     );
 }
 
-
-static bool update_dc_electrical_endpoint(
+static bool publish_dc_measurements(
     uint8_t endpoint,
     uint16_t voltage_cV,
     uint16_t current_cA,
@@ -406,7 +516,7 @@ static bool update_dc_electrical_endpoint(
 {
     int16_t voltage = clamp_zcl_measurement(voltage_cV);
     int16_t current = clamp_zcl_measurement(current_cA);
-    int16_t power = clamp_zcl_measurement(power_cW);
+    int16_t power = clamp_zcl_measurement(power_cW / 10U);
     bool success = set_attribute(
         endpoint,
         EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
@@ -428,16 +538,13 @@ static bool update_dc_electrical_endpoint(
     return success;
 }
 
-static bool update_telemetry(const epsolar_telemetry_t *telemetry)
+static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
 {
-    if (!esp_zigbee_lock_acquire(portMAX_DELAY)) {
-        ESP_LOGW(TAG, "Unable to acquire Zigbee lock for telemetry update");
-        return false;
-    }
+    esp_zigbee_lock_acquire(portMAX_DELAY);
 
     bool success = true;
     if (telemetry->valid & EPSOLAR_VALID_ARRAY) {
-        success &= update_dc_electrical_endpoint(
+        success &= publish_dc_measurements(
             EPSOLAR_ARRAY_ENDPOINT,
             telemetry->array_voltage_cV,
             telemetry->array_current_cA,
@@ -445,7 +552,7 @@ static bool update_telemetry(const epsolar_telemetry_t *telemetry)
         );
     }
     if (telemetry->valid & EPSOLAR_VALID_LOAD) {
-        success &= update_dc_electrical_endpoint(
+        success &= publish_dc_measurements(
             EPSOLAR_LOAD_ENDPOINT,
             telemetry->load_voltage_cV,
             telemetry->load_current_cA,
@@ -469,6 +576,7 @@ static bool update_telemetry(const epsolar_telemetry_t *telemetry)
         );
     }
     if (telemetry->valid & EPSOLAR_VALID_BATTERY_LEVEL) {
+        static uint8_t reported_source_level = UINT8_MAX;
         uint8_t battery_percentage =
             clamp_battery_percentage(telemetry->battery_level_percent);
         uint8_t percentage_remaining = battery_percentage * 2U;
@@ -479,9 +587,14 @@ static bool update_telemetry(const epsolar_telemetry_t *telemetry)
             &percentage_remaining
         );
         success &= set_analog_value(EPSOLAR_BATTERY_ENDPOINT, battery_percentage);
-        success &= set_battery_power_descriptor(
-            battery_power_source_level(battery_percentage)
-        );
+        uint8_t source_level = battery_power_source_level(battery_percentage);
+        if (source_level != reported_source_level) {
+            if (set_battery_power_descriptor(source_level)) {
+                reported_source_level = source_level;
+            } else {
+                success = false;
+            }
+        }
     }
     if (telemetry->valid & EPSOLAR_VALID_BATTERY_ELECTRICAL) {
         int16_t battery_voltage = clamp_zcl_measurement(telemetry->battery_voltage_cV);
@@ -529,25 +642,53 @@ static void telemetry_task(void *arg)
             esp_err_to_name(err),
             EPSOLAR_MODBUS_INIT_RETRY_MS
         );
-        epsolar_modbus_deinit(&modbus);
         vTaskDelay(pdMS_TO_TICKS(EPSOLAR_MODBUS_INIT_RETRY_MS));
     }
 
+    TickType_t last_wake = xTaskGetTickCount();
     while (true) {
         epsolar_telemetry_t telemetry;
         err = epsolar_read_telemetry(&modbus, &telemetry);
+        s_diag.cycles++;
+        s_diag.last_cycle_uptime_s = uptime_seconds();
         if (err == ESP_OK) {
-            if (update_telemetry(&telemetry)) {
-                ESP_LOGI(
-                    TAG,
-                    "Updated Zigbee telemetry (valid mask 0x%02" PRIx32 ")",
-                    telemetry.valid
-                );
+            if (publish_telemetry(&telemetry)) {
+                s_diag.last_publish_uptime_s = s_diag.last_cycle_uptime_s;
+            } else {
+                s_diag.publish_failures++;
             }
         } else {
+            s_diag.modbus_failures++;
             ESP_LOGW(TAG, "No EPSolar telemetry available");
         }
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS * 1000U));
+
+        esp_zigbee_lock_acquire(portMAX_DELAY);
+        bool joined = ezb_bdb_dev_joined();
+        uint16_t short_address = ezb_nwk_get_short_address();
+        esp_zigbee_lock_release();
+
+        ESP_LOGI(
+            TAG,
+            "cycle=%" PRIu32 " uptime=%" PRIu32 "s valid=0x%02" PRIx32
+            " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
+            " last_publish=%" PRIu32 "s joined=%d addr=0x%04x heap=%" PRIu32
+            " min_heap=%" PRIu32 " light_sleep=%d",
+            s_diag.cycles,
+            s_diag.last_cycle_uptime_s,
+            err == ESP_OK ? telemetry.valid : 0U,
+            s_diag.modbus_failures,
+            s_diag.publish_failures,
+            s_diag.last_publish_uptime_s,
+            joined,
+            short_address,
+            esp_get_free_heap_size(),
+            esp_get_minimum_free_heap_size(),
+            s_diag.light_sleep_enabled
+        );
+        if (s_diag.cycles % EPSOLAR_DIAG_SAVE_CYCLES == 0) {
+            save_diagnostics();
+        }
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS * 1000U));
     }
 }
 
@@ -646,6 +787,15 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
         break;
     }
 
+    case EZB_ZDO_SIGNAL_LEAVE: {
+        const ezb_zdo_signal_leave_params_t *leave = ezb_app_signal_get_params(signal);
+        if (leave->leave_type == EZB_ZDO_LEAVE_TYPE_RESET) {
+            ESP_LOGW(TAG, "Removed from Zigbee network; restarting network steering");
+            schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
+        }
+        break;
+    }
+
     default:
         ESP_LOGI(TAG, "Zigbee signal: %s (0x%02x)", ezb_app_signal_to_string(type), type);
         break;
@@ -661,7 +811,9 @@ static void zigbee_task(void *arg)
             .install_code_policy = false,
             .zed_config = {
                 .ed_timeout = EZB_NWK_ED_TIMEOUT_64MIN,
-                .keep_alive = 3000,
+                /* Stack default: a quarter of the ED timeout. A short keep
+                 * alive keeps the radio awake and defeats light sleep. */
+                .keep_alive = 960000,
             },
         },
         .platform_config = {
@@ -717,6 +869,7 @@ void app_main(void)
     configure_power_management(false);
 #endif
     ESP_LOGI(TAG, "Starting ESP32-C6 EPSolar Zigbee sensor");
+    report_boot_diagnostics();
     ESP_ERROR_CHECK(
         xTaskCreate(zigbee_task, "zigbee_main", 6144, NULL, 5, NULL) == pdPASS
             ? ESP_OK

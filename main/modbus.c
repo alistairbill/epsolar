@@ -32,13 +32,17 @@ static const mb_parameter_descriptor_t register_blocks[] = {
 
 esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus)
 {
-    if (modbus == NULL) {
-        return ESP_ERR_INVALID_ARG;
+#ifdef CONFIG_PM_ENABLE
+    esp_err_t lock_err = esp_pm_lock_create(
+        ESP_PM_NO_LIGHT_SLEEP,
+        0,
+        "epsolar_modbus",
+        &modbus->pm_lock
+    );
+    if (lock_err != ESP_OK) {
+        return lock_err;
     }
-    if (modbus->handle != NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
+#endif
     mb_communication_info_t communication = {
         .ser_opts = {
             .mode = MB_RTU,
@@ -54,6 +58,10 @@ esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus)
 
     esp_err_t err = mbc_master_create_serial(&communication, &modbus->handle);
     if (err != ESP_OK) {
+#ifdef CONFIG_PM_ENABLE
+        esp_pm_lock_delete(modbus->pm_lock);
+        modbus->pm_lock = NULL;
+#endif
         return err;
     }
 
@@ -77,17 +85,12 @@ esp_err_t epsolar_modbus_init(epsolar_modbus_t *modbus)
     if (err != ESP_OK) {
         mbc_master_delete(modbus->handle);
         modbus->handle = NULL;
+#ifdef CONFIG_PM_ENABLE
+        esp_pm_lock_delete(modbus->pm_lock);
+        modbus->pm_lock = NULL;
+#endif
     }
     return err;
-}
-
-void epsolar_modbus_deinit(epsolar_modbus_t *modbus)
-{
-    if (modbus == NULL || modbus->handle == NULL) {
-        return;
-    }
-    mbc_master_delete(modbus->handle);
-    modbus->handle = NULL;
 }
 
 esp_err_t epsolar_modbus_read_block(
@@ -96,22 +99,18 @@ esp_err_t epsolar_modbus_read_block(
     uint16_t *registers
 )
 {
-    if (modbus == NULL || modbus->handle == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (registers == NULL || (unsigned)block >= EPSOLAR_MODBUS_BLOCK_COUNT) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
     uint8_t parameter_type = 0;
+#ifdef CONFIG_PM_ENABLE
+    esp_pm_lock_acquire(modbus->pm_lock);
+#endif
     esp_err_t err = mbc_master_get_parameter(
         modbus->handle,
         block,
         (uint8_t *)registers,
         &parameter_type
     );
-    if (err == ESP_OK && parameter_type != PARAM_TYPE_BIN) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
+#ifdef CONFIG_PM_ENABLE
+    esp_pm_lock_release(modbus->pm_lock);
+#endif
     return err;
 }
