@@ -25,6 +25,13 @@
 #define EPSOLAR_STORAGE_PARTITION "zb_storage"
 #define EPSOLAR_REPORT_MIN_INTERVAL_S 30
 #define EPSOLAR_REPORT_MAX_INTERVAL_S 180
+/* Nothing above the application notices when its frames stop reaching the
+ * coordinator: attribute writes keep succeeding locally. These watchdogs run
+ * off the confirmed link probe instead. */
+#define EPSOLAR_LINK_STALL_REJOIN_S 600
+#define EPSOLAR_LINK_STALL_RESTART_S 1800
+#define EPSOLAR_REJOIN_BACKOFF_S 300
+#define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
 #define EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS 120000
@@ -56,18 +63,25 @@ static bool telemetry_task_started;
  * they also survive an EN-pin reset or a power cycle, which drop RTC RAM.
  * This is the only readout channel once light sleep has killed USB Serial
  * JTAG: let it fail, reset the board, read the boot line. */
-#define EPSOLAR_DIAG_MAGIC 0x45505331U /* "EPS1" */
+#define EPSOLAR_DIAG_MAGIC 0x45505332U /* "EPS2" */
 #define EPSOLAR_DIAG_NAMESPACE "epsolar"
 #define EPSOLAR_DIAG_KEY "diag"
 #define EPSOLAR_DIAG_SAVE_CYCLES 10
 
+/* Counters are bumped from both the telemetry task and the Zigbee stack task.
+ * The increments are not atomic; a lost count in a diagnostic is cheaper than
+ * a lock on the stack's confirm path. */
 typedef struct {
     uint32_t magic;
     uint32_t boots;
     uint32_t cycles;
     uint32_t modbus_failures;
     uint32_t publish_failures;
+    uint32_t report_confirms;
+    uint32_t report_failures;
+    uint32_t rejoins;
     uint32_t last_publish_uptime_s;
+    uint32_t last_confirm_uptime_s;
     uint32_t last_cycle_uptime_s;
     bool light_sleep_enabled;
 } epsolar_diag_t;
@@ -134,15 +148,21 @@ static void report_boot_diagnostics(void)
             TAG,
             "Boot %" PRIu32 " (reset reason %d); previous run (%s): cycles=%" PRIu32
             " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
-            " last_cycle=%" PRIu32 "s last_publish=%" PRIu32 "s light_sleep=%d",
+            " report_confirms=%" PRIu32 " report_failures=%" PRIu32 " rejoins=%" PRIu32
+            " last_cycle=%" PRIu32 "s last_publish=%" PRIu32 "s last_confirm=%" PRIu32
+            "s light_sleep=%d",
             previous.boots + 1,
             reason,
             source,
             previous.cycles,
             previous.modbus_failures,
             previous.publish_failures,
+            previous.report_confirms,
+            previous.report_failures,
+            previous.rejoins,
             previous.last_cycle_uptime_s,
             previous.last_publish_uptime_s,
+            previous.last_confirm_uptime_s,
             previous.light_sleep_enabled
         );
     }
@@ -545,7 +565,10 @@ static const struct {
 #define EPSOLAR_REPORTED_ATTRIBUTE_COUNT \
     (sizeof(reported_attributes) / sizeof(reported_attributes[0]))
 
-/* Caller holds the Zigbee stack lock.
+/* Caller holds the Zigbee stack lock. Returns true once every attribute is
+ * armed, so the caller can keep retrying: the coordinator's Configure
+ * Reporting is what creates the reporting records, and on a fresh join it can
+ * land after our first telemetry cycle.
  *
  * zigbee2mqtt asks for min 10 s / max 300 s, but that configuration only
  * produces on-change reports here: the max-interval heartbeat never fires, so
@@ -553,7 +576,7 @@ static const struct {
  * reportable attribute locally with a zero reportable change, which makes the
  * stack emit on every telemetry cycle it sees a write, and re-assert the
  * intervals independently of whatever the coordinator configured. */
-static void configure_local_reporting(void)
+static bool configure_local_reporting(void)
 {
     uint32_t present = 0;
     uint32_t armed = 0;
@@ -591,17 +614,23 @@ static void configure_local_reporting(void)
         ezb_zcl_reporting_start_attr_report(info);
         armed |= 1U << i;
     }
-    ESP_LOGW(
-        TAG,
-        "Reporting records present for %d/%d attributes (mask 0x%05" PRIx32 "); "
-        "armed %d at %us/%us with zero reportable change",
-        __builtin_popcount(present),
-        (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT,
-        present,
-        __builtin_popcount(armed),
-        EPSOLAR_REPORT_MIN_INTERVAL_S,
-        EPSOLAR_REPORT_MAX_INTERVAL_S
-    );
+
+    static uint32_t logged_armed = UINT32_MAX;
+    if (armed != logged_armed) {
+        logged_armed = armed;
+        ESP_LOGW(
+            TAG,
+            "Reporting records present for %d/%d attributes (mask 0x%05" PRIx32 "); "
+            "armed %d at %us/%us with zero reportable change",
+            __builtin_popcount(present),
+            (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT,
+            present,
+            __builtin_popcount(armed),
+            EPSOLAR_REPORT_MIN_INTERVAL_S,
+            EPSOLAR_REPORT_MAX_INTERVAL_S
+        );
+    }
+    return __builtin_popcount(armed) == (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT;
 }
 
 static bool set_attribute(uint8_t endpoint, uint16_t cluster, uint16_t attribute, void *value)
@@ -762,12 +791,111 @@ static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
 
     static bool reporting_configured;
     if (!reporting_configured) {
-        configure_local_reporting();
-        reporting_configured = true;
+        reporting_configured = configure_local_reporting();
     }
 
     esp_zigbee_lock_release();
     return success;
+}
+
+static void schedule_commissioning_retry(uint8_t mode);
+
+/* Runs in the Zigbee stack task with the stack lock already held.
+ *
+ * The application confirm hook only fires for frames the application submitted
+ * itself; reports the stack's reporting engine emits are confirmed internally
+ * and are invisible here. That is why the probe below exists. */
+static void link_probe_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
+{
+    (void)user_ctx;
+    if (cnf->status == 0) {
+        s_diag.report_confirms++;
+        s_diag.last_confirm_uptime_s = uptime_seconds();
+        return;
+    }
+    s_diag.report_failures++;
+    ESP_LOGW(
+        TAG,
+        "Link probe not delivered: cluster=0x%04x status=0x%02x",
+        cnf->cluster_id,
+        cnf->status
+    );
+}
+
+/* One acknowledged Report Attributes per telemetry cycle, sent straight to the
+ * coordinator. It is the only end-to-end delivery evidence the application can
+ * get: ezb_zcl_set_attr_value() succeeds against a dead radio path, and
+ * ezb_bdb_dev_joined() keeps returning true with a dead parent.
+ *
+ * Exactly one frame per cycle, and the caller must not hold the stack lock:
+ * bursting reports drains the fixed out-buffer pool and starves the mainloop
+ * that would otherwise drain it. */
+static void send_link_probe(void)
+{
+    ezb_zcl_report_attr_cmd_t command = {
+        .cmd_ctrl = {
+            .dst_addr = {
+                .addr_mode = EZB_ADDR_MODE_SHORT,
+                .u = {.short_addr = 0x0000},
+            },
+            .dst_ep = 1,
+            .src_ep = EPSOLAR_ARRAY_ENDPOINT,
+            .cluster_id = EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
+            .manuf_code = EZB_ZCL_STD_MANUF_CODE,
+            .fc = {.direction = 1, .dis_default_rsp = 1},
+            .cnf_ctx = {.cb = link_probe_confirm},
+        },
+        .payload = {.attr_id = EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID},
+    };
+
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    ezb_err_t err = ezb_zcl_report_attr_cmd_req(&command);
+    esp_zigbee_lock_release();
+
+    if (err != EZB_ERR_NONE) {
+        s_diag.report_failures++;
+        ESP_LOGW(TAG, "Link probe rejected by the stack: 0x%04x", err);
+    }
+}
+
+/* A rejoin, not a fresh join: BDB steering on a device that is not factory new
+ * re-attaches to the stored network and picks a new parent if the old one is
+ * gone. */
+static void request_rejoin(const char *reason)
+{
+    static uint32_t last_attempt_uptime_s;
+    uint32_t now = uptime_seconds();
+    if (now - last_attempt_uptime_s < EPSOLAR_REJOIN_BACKOFF_S) {
+        return;
+    }
+    last_attempt_uptime_s = now;
+    s_diag.rejoins++;
+    ESP_LOGW(TAG, "Rejoining Zigbee network: %s", reason);
+    schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
+}
+
+/* Nothing in the stack tells the application that its reports stopped leaving
+ * the node: ezb_bdb_dev_joined() keeps returning true with a dead parent and
+ * the attribute writes keep succeeding, so the confirm clock is the only
+ * liveness signal available. */
+static void check_link_health(bool joined)
+{
+    if (!joined) {
+        return;
+    }
+    uint32_t silent_s = uptime_seconds() - s_diag.last_confirm_uptime_s;
+    if (silent_s >= EPSOLAR_LINK_STALL_RESTART_S) {
+        ESP_LOGE(
+            TAG,
+            "No report confirmation for %" PRIu32 "s despite a rejoin; restarting",
+            silent_s
+        );
+        save_diagnostics();
+        esp_restart();
+    }
+    if (silent_s >= EPSOLAR_LINK_STALL_REJOIN_S) {
+        request_rejoin("no report confirmation for 10 minutes");
+    }
 }
 
 static void telemetry_task(void *arg)
@@ -801,6 +929,8 @@ static void telemetry_task(void *arg)
             ESP_LOGW(TAG, "No EPSolar telemetry available");
         }
 
+        send_link_probe();
+
         esp_zigbee_lock_acquire(portMAX_DELAY);
         bool joined = ezb_bdb_dev_joined();
         uint16_t short_address = ezb_nwk_get_short_address();
@@ -810,20 +940,26 @@ static void telemetry_task(void *arg)
             TAG,
             "cycle=%" PRIu32 " uptime=%" PRIu32 "s valid=0x%02" PRIx32
             " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
-            " last_publish=%" PRIu32 "s joined=%d addr=0x%04x heap=%" PRIu32
-            " min_heap=%" PRIu32 " light_sleep=%d",
+            " last_publish=%" PRIu32 "s report_confirms=%" PRIu32 " report_failures=%" PRIu32
+            " last_confirm=%" PRIu32 "s rejoins=%" PRIu32
+            " joined=%d addr=0x%04x heap=%" PRIu32 " min_heap=%" PRIu32 " light_sleep=%d",
             s_diag.cycles,
             s_diag.last_cycle_uptime_s,
             err == ESP_OK ? telemetry.valid : 0U,
             s_diag.modbus_failures,
             s_diag.publish_failures,
             s_diag.last_publish_uptime_s,
+            s_diag.report_confirms,
+            s_diag.report_failures,
+            s_diag.last_confirm_uptime_s,
+            s_diag.rejoins,
             joined,
             short_address,
             esp_get_free_heap_size(),
             esp_get_minimum_free_heap_size(),
             s_diag.light_sleep_enabled
         );
+        check_link_health(joined);
         if (s_diag.cycles % EPSOLAR_DIAG_SAVE_CYCLES == 0) {
             save_diagnostics();
         }
@@ -935,6 +1071,25 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
         break;
     }
 
+    case EZB_NWK_SIGNAL_NETWORK_STATUS: {
+        const ezb_nwk_signal_network_status_params_t *nwk = ezb_app_signal_get_params(signal);
+        ESP_LOGW(
+            TAG,
+            "Zigbee network status 0x%02x (%s) reported by 0x%04x",
+            nwk->status,
+            ezb_nwk_network_status_to_string(nwk->status),
+            nwk->network_addr
+        );
+        if (nwk->status == EZB_NWK_NETWORK_STATUS_PARENT_LINK_FAILURE) {
+            request_rejoin("parent link failure");
+        }
+        break;
+    }
+
+    case EZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
+        request_rejoin("no active links left");
+        break;
+
     default:
         ESP_LOGI(TAG, "Zigbee signal: %s (0x%02x)", ezb_app_signal_to_string(type), type);
         break;
@@ -949,10 +1104,13 @@ static void zigbee_task(void *arg)
             .device_type = EZB_NWK_DEVICE_TYPE_END_DEVICE,
             .install_code_policy = false,
             .zed_config = {
-                .ed_timeout = EZB_NWK_ED_TIMEOUT_64MIN,
-                /* Stack default: a quarter of the ED timeout. A short keep
-                 * alive keeps the radio awake and defeats light sleep. */
-                .keep_alive = 960000,
+                /* The parent ages the child out after ed_timeout without a
+                 * keepalive, and an end device that only polls every few
+                 * minutes cannot receive anything: the parent holds indirect
+                 * transactions for 7.68 s. Poll on the telemetry cadence, so
+                 * downlink works and a dead parent is noticed in minutes. */
+                .ed_timeout = EZB_NWK_ED_TIMEOUT_8MIN,
+                .keep_alive = EPSOLAR_ZIGBEE_KEEP_ALIVE_MS,
             },
         },
         .platform_config = {
