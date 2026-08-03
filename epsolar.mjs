@@ -81,12 +81,20 @@ function decodeBatteryStatus(value) {
     };
 }
 
+// 0x3201: D0 running/standby, D1 generic fault, D3-D2 charging stage,
+// D4 PV short, D7-D13 MOSFET/over-current/load faults, D15-D14 input status.
+// D6-D5 are reserved and must stay out of the fault mask.
+const CHARGING_FAULT_BITS = 0x3f92;
+// 0x3202: D0 running/standby, D1 generic fault, D4-D11 discharge faults,
+// D13-D12 output power band, D15-D14 input voltage status.
+const DISCHARGING_FAULT_BITS = 0x0ff2;
+
 function decodeChargingStatus(value) {
     return {
         charging_stage: mappedStatus(chargingStages, (value >> 2) & 0x03),
         pv_input_status: mappedStatus(pvInputStatuses, (value >> 14) & 0x03),
         charging_running: (value & (1 << 0)) !== 0,
-        charging_fault: (value & 0x3fd2) !== 0,
+        charging_fault: (value & CHARGING_FAULT_BITS) !== 0,
     };
 }
 
@@ -95,7 +103,7 @@ function decodeDischargingStatus(value) {
         load_input_status: mappedStatus(loadInputStatuses, (value >> 14) & 0x03),
         load_power_status: mappedStatus(loadPowerStatuses, (value >> 12) & 0x03),
         load_running: (value & (1 << 0)) !== 0,
-        load_fault: (value & 0x0ff2) !== 0,
+        load_fault: (value & DISCHARGING_FAULT_BITS) !== 0,
     };
 }
 
@@ -237,11 +245,11 @@ const definition = {
         binary('battery_rated_voltage_error', 'Battery rated-voltage identification error'),
         enumeration('charging_stage', chargingStages, 'Controller charging stage'),
         enumeration('pv_input_status', pvInputStatuses, 'PV input state'),
-        binary('charging_running', 'Whether the controller is charging'),
+        binary('charging_running', 'Charging stage running rather than in standby; charging_stage says whether it is actually charging'),
         binary('charging_fault', 'Whether the charging circuit reports a fault'),
         enumeration('load_input_status', loadInputStatuses, 'Load input-voltage state'),
-        enumeration('load_power_status', loadPowerStatuses, 'Load power state'),
-        binary('load_running', 'Whether the controller load output is running'),
+        enumeration('load_power_status', loadPowerStatuses, 'Load output power band; reads light whenever the draw is below moderate, including zero'),
+        binary('load_running', 'Load output stage running rather than in standby; stays true with the output energised and nothing drawing, so read load_current for actual draw'),
         binary('load_fault', 'Whether the load circuit reports a fault'),
     ],
     configure: async (device, coordinatorEndpoint) => {
