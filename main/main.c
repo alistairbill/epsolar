@@ -26,10 +26,14 @@
 #define EPSOLAR_REPORT_MIN_INTERVAL_S 30
 #define EPSOLAR_REPORT_MAX_INTERVAL_S 180
 /* Nothing above the application notices when its frames stop reaching the
- * coordinator: attribute writes keep succeeding locally. These watchdogs run
- * off the confirmed link probe instead. */
-#define EPSOLAR_LINK_STALL_REJOIN_S 600
-#define EPSOLAR_LINK_STALL_RESTART_S 1800
+ * coordinator: attribute writes keep succeeding locally, so the confirmed link
+ * probe is the only liveness signal. Repairs escalate one step per stall
+ * window, and the window restarts on every repair, so no repair is judged on
+ * silence it never had the chance to break: the restart at the end of the
+ * ladder needs EPSOLAR_LINK_STALL_S * (EPSOLAR_LINK_REPAIR_ATTEMPTS + 1) of
+ * uninterrupted silence. */
+#define EPSOLAR_LINK_STALL_S 600
+#define EPSOLAR_LINK_REPAIR_ATTEMPTS 3
 #define EPSOLAR_REJOIN_BACKOFF_S 300
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
@@ -63,7 +67,7 @@ static bool telemetry_task_started;
  * they also survive an EN-pin reset or a power cycle, which drop RTC RAM.
  * This is the only readout channel once light sleep has killed USB Serial
  * JTAG: let it fail, reset the board, read the boot line. */
-#define EPSOLAR_DIAG_MAGIC 0x45505332U /* "EPS2" */
+#define EPSOLAR_DIAG_MAGIC 0x45505333U /* "EPS3" */
 #define EPSOLAR_DIAG_NAMESPACE "epsolar"
 #define EPSOLAR_DIAG_KEY "diag"
 #define EPSOLAR_DIAG_SAVE_CYCLES 10
@@ -79,10 +83,13 @@ typedef struct {
     uint32_t publish_failures;
     uint32_t report_confirms;
     uint32_t report_failures;
+    uint32_t probe_streak;
+    uint32_t announces;
     uint32_t rejoins;
     uint32_t last_publish_uptime_s;
     uint32_t last_confirm_uptime_s;
     uint32_t last_cycle_uptime_s;
+    uint8_t last_probe_status;
     bool light_sleep_enabled;
 } epsolar_diag_t;
 
@@ -148,7 +155,8 @@ static void report_boot_diagnostics(void)
             TAG,
             "Boot %" PRIu32 " (reset reason %d); previous run (%s): cycles=%" PRIu32
             " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
-            " report_confirms=%" PRIu32 " report_failures=%" PRIu32 " rejoins=%" PRIu32
+            " report_confirms=%" PRIu32 " report_failures=%" PRIu32
+            " last_probe_status=0x%02x announces=%" PRIu32 " rejoins=%" PRIu32
             " last_cycle=%" PRIu32 "s last_publish=%" PRIu32 "s last_confirm=%" PRIu32
             "s light_sleep=%d",
             previous.boots + 1,
@@ -159,6 +167,8 @@ static void report_boot_diagnostics(void)
             previous.publish_failures,
             previous.report_confirms,
             previous.report_failures,
+            previous.last_probe_status,
+            previous.announces,
             previous.rejoins,
             previous.last_cycle_uptime_s,
             previous.last_publish_uptime_s,
@@ -800,6 +810,36 @@ static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
 
 static void schedule_commissioning_retry(uint8_t mode);
 
+/* APSDE-DATA.confirm statuses a probe can plausibly see (Zigbee specification
+ * table 2.27). "no APS ack" is the interesting one: the frame left the node and
+ * the end-to-end acknowledgement never came back, so the uplink can still be
+ * perfectly healthy while nothing addressed to this node arrives. */
+static const char *aps_status_name(uint8_t status)
+{
+    switch (status) {
+    case 0x00: return "success";
+    case 0xa0: return "ASDU too long";
+    case 0xa3: return "illegal request";
+    case 0xa4: return "invalid binding";
+    case 0xa6: return "invalid parameter";
+    case 0xa7: return "no APS ack";
+    case 0xa8: return "no bound device";
+    case 0xa9: return "no short address";
+    case 0xaa: return "not supported";
+    case 0xad: return "security failure";
+    case 0xae: return "table full";
+    case 0xaf: return "unsecured";
+    default: return "unknown";
+    }
+}
+
+/* Progress through the repair ladder since the last confirmed delivery. */
+static struct {
+    uint32_t last_repair_uptime_s;
+    uint32_t last_rejoin_uptime_s;
+    uint8_t repair_stage;
+} s_link;
+
 /* Runs in the Zigbee stack task with the stack lock already held.
  *
  * The application confirm hook only fires for frames the application submitted
@@ -808,18 +848,26 @@ static void schedule_commissioning_retry(uint8_t mode);
 static void link_probe_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
 {
     (void)user_ctx;
+    s_diag.last_probe_status = cnf->status;
     if (cnf->status == 0) {
         s_diag.report_confirms++;
         s_diag.last_confirm_uptime_s = uptime_seconds();
+        s_diag.probe_streak = 0;
+        s_link.repair_stage = 0;
         return;
     }
     s_diag.report_failures++;
-    ESP_LOGW(
-        TAG,
-        "Link probe not delivered: cluster=0x%04x status=0x%02x",
-        cnf->cluster_id,
-        cnf->status
-    );
+    /* One line per outage: the cycle line carries the streak, and each repair
+     * attempt logs itself. */
+    if (++s_diag.probe_streak == 1) {
+        ESP_LOGW(
+            TAG,
+            "Link probe not delivered: cluster=0x%04x status=0x%02x (%s)",
+            cnf->cluster_id,
+            cnf->status,
+            aps_status_name(cnf->status)
+        );
+    }
 }
 
 /* One acknowledged Report Attributes per telemetry cycle, sent straight to the
@@ -854,48 +902,126 @@ static void send_link_probe(void)
 
     if (err != EZB_ERR_NONE) {
         s_diag.report_failures++;
+        s_diag.probe_streak++;
         ESP_LOGW(TAG, "Link probe rejected by the stack: 0x%04x", err);
     }
 }
 
+static void device_annce_confirm(const ezb_zdo_device_annce_req_result_t *result, void *user_ctx)
+{
+    (void)user_ctx;
+    if (result->error != EZB_ERR_NONE) {
+        ESP_LOGW(TAG, "Device announcement not sent: 0x%04x", result->error);
+    }
+}
+
+/* Device_annce, broadcast to every device whose receiver is on.
+ *
+ * A secure rejoin keeps the short address, and the stack only re-announces when
+ * the address changed. Routers and the coordinator therefore keep forwarding
+ * everything addressed to this node towards the router that used to be its
+ * parent: uplink keeps working - reports still reach zigbee2mqtt and the values
+ * in Home Assistant keep moving - while nothing comes back, APS
+ * acknowledgements included. The announcement refreshes the address map and the
+ * routes, and it is by far the cheapest repair for that half-dead state.
+ *
+ * Caller holds the Zigbee stack lock. */
+static bool announce_presence_locked(void)
+{
+    ezb_zdo_device_annce_req_t request = {.cb = device_annce_confirm};
+    ezb_err_t err = ezb_zdo_device_annce_req(&request);
+    if (err != EZB_ERR_NONE) {
+        ESP_LOGW(TAG, "Unable to announce this device: 0x%04x", err);
+        return false;
+    }
+    s_diag.announces++;
+    return true;
+}
+
+static bool announce_presence(void)
+{
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    bool announced = announce_presence_locked();
+    esp_zigbee_lock_release();
+    return announced;
+}
+
 /* A rejoin, not a fresh join: BDB steering on a device that is not factory new
  * re-attaches to the stored network and picks a new parent if the old one is
- * gone. */
-static void request_rejoin(const char *reason)
+ * gone. Returns whether the rejoin was actually started. */
+static bool request_rejoin(const char *reason)
 {
-    static uint32_t last_attempt_uptime_s;
     uint32_t now = uptime_seconds();
-    if (now - last_attempt_uptime_s < EPSOLAR_REJOIN_BACKOFF_S) {
-        return;
+    if (s_link.last_rejoin_uptime_s != 0
+        && now - s_link.last_rejoin_uptime_s < EPSOLAR_REJOIN_BACKOFF_S) {
+        return false;
     }
-    last_attempt_uptime_s = now;
+    s_link.last_rejoin_uptime_s = now;
     s_diag.rejoins++;
     ESP_LOGW(TAG, "Rejoining Zigbee network: %s", reason);
     schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
+    return true;
 }
 
-/* Nothing in the stack tells the application that its reports stopped leaving
- * the node: ezb_bdb_dev_joined() keeps returning true with a dead parent and
- * the attribute writes keep succeeding, so the confirm clock is the only
- * liveness signal available. */
+/* Nothing in the stack tells the application that its frames stopped being
+ * acknowledged: ezb_bdb_dev_joined() keeps returning true with a dead parent
+ * and the attribute writes keep succeeding, so the confirm clock is the only
+ * liveness signal available.
+ *
+ * A rejoin alone does not repair a stale downlink path, which is why the ladder
+ * announces the device first and only then reaches for heavier hammers. */
 static void check_link_health(bool joined)
 {
     if (!joined) {
         return;
     }
-    uint32_t silent_s = uptime_seconds() - s_diag.last_confirm_uptime_s;
-    if (silent_s >= EPSOLAR_LINK_STALL_RESTART_S) {
+    uint32_t now = uptime_seconds();
+    uint32_t silent_s = now - s_diag.last_confirm_uptime_s;
+    if (silent_s < EPSOLAR_LINK_STALL_S
+        || now - s_link.last_repair_uptime_s < EPSOLAR_LINK_STALL_S) {
+        return;
+    }
+
+    if (s_link.repair_stage >= EPSOLAR_LINK_REPAIR_ATTEMPTS) {
         ESP_LOGE(
             TAG,
-            "No report confirmation for %" PRIu32 "s despite a rejoin; restarting",
-            silent_s
+            "No report confirmation for %" PRIu32 "s after %u repairs; restarting",
+            silent_s,
+            s_link.repair_stage
         );
         save_diagnostics();
         esp_restart();
     }
-    if (silent_s >= EPSOLAR_LINK_STALL_REJOIN_S) {
-        request_rejoin("no report confirmation for 10 minutes");
+
+    bool repaired;
+    if (s_link.repair_stage == 0) {
+        ESP_LOGW(
+            TAG,
+            "No report confirmation for %" PRIu32 "s (last status 0x%02x); announcing this device",
+            silent_s,
+            s_diag.last_probe_status
+        );
+        repaired = announce_presence();
+    } else {
+        repaired = request_rejoin("still no report confirmation after announcing this device");
     }
+    if (repaired) {
+        s_link.repair_stage++;
+        s_link.last_repair_uptime_s = now;
+    }
+}
+
+/* The neighbor table of an end device holds its parent, and the entry is gone
+ * once the link to it is lost. Caller holds the Zigbee stack lock. */
+static bool find_parent(ezb_nwk_neighbor_info_t *parent)
+{
+    ezb_nwk_info_iterator_t iterator = EZB_NWK_INFO_ITERATOR_INIT;
+    while (ezb_nwk_get_next_neighbor(&iterator, parent) == EZB_ERR_NONE) {
+        if (parent->relationship == EZB_NWK_RELATIONSHIP_PARENT) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void telemetry_task(void *arg)
@@ -931,33 +1057,37 @@ static void telemetry_task(void *arg)
 
         send_link_probe();
 
+        ezb_nwk_neighbor_info_t parent;
         esp_zigbee_lock_acquire(portMAX_DELAY);
         bool joined = ezb_bdb_dev_joined();
         uint16_t short_address = ezb_nwk_get_short_address();
+        bool parented = find_parent(&parent);
         esp_zigbee_lock_release();
 
+        uint32_t now = s_diag.last_cycle_uptime_s;
         ESP_LOGI(
             TAG,
-            "cycle=%" PRIu32 " uptime=%" PRIu32 "s valid=0x%02" PRIx32
-            " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
-            " last_publish=%" PRIu32 "s report_confirms=%" PRIu32 " report_failures=%" PRIu32
-            " last_confirm=%" PRIu32 "s rejoins=%" PRIu32
-            " joined=%d addr=0x%04x heap=%" PRIu32 " min_heap=%" PRIu32 " light_sleep=%d",
+            "cycle=%" PRIu32 " up=%" PRIu32 "s valid=0x%02" PRIx32
+            " data_age=%" PRIu32 "s ack_age=%" PRIu32 "s"
+            " modbus_fail=%" PRIu32 " publish_fail=%" PRIu32
+            " probe_ok=%" PRIu32 " probe_fail=%" PRIu32 " rejoins=%" PRIu32
+            " joined=%d addr=0x%04x parent=0x%04x lqi=%u heap=%" PRIu32 "/%" PRIu32,
             s_diag.cycles,
-            s_diag.last_cycle_uptime_s,
+            now,
             err == ESP_OK ? telemetry.valid : 0U,
+            now - s_diag.last_publish_uptime_s,
+            now - s_diag.last_confirm_uptime_s,
             s_diag.modbus_failures,
             s_diag.publish_failures,
-            s_diag.last_publish_uptime_s,
             s_diag.report_confirms,
             s_diag.report_failures,
-            s_diag.last_confirm_uptime_s,
             s_diag.rejoins,
             joined,
             short_address,
+            parented ? parent.short_addr : 0xffffU,
+            parented ? parent.lqi : 0U,
             esp_get_free_heap_size(),
-            esp_get_minimum_free_heap_size(),
-            s_diag.light_sleep_enabled
+            esp_get_minimum_free_heap_size()
         );
         check_link_health(joined);
         if (s_diag.cycles % EPSOLAR_DIAG_SAVE_CYCLES == 0) {
@@ -975,6 +1105,20 @@ static void start_telemetry_task(void)
     BaseType_t created = xTaskCreate(telemetry_task, "epsolar_read", 6144, NULL, 4, NULL);
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     telemetry_task_started = true;
+}
+
+/* Every (re)join is a repair, whether this application asked for it or the
+ * stack rejoined on its own: announce the node so the network stops routing to
+ * the router that used to be its parent, and give the repair ladder a fresh
+ * window in which a confirmation can arrive. Caller holds the stack lock. */
+static void on_network_joined(void)
+{
+    announce_presence_locked();
+    s_link.last_repair_uptime_s = uptime_seconds();
+#ifdef CONFIG_PM_ENABLE
+    schedule_light_sleep_enable();
+#endif
+    start_telemetry_task();
 }
 
 static void commissioning_retry_task(void *arg)
@@ -1030,10 +1174,7 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             }
         } else {
             ESP_LOGI(TAG, "Zigbee device resumed its saved network");
-#ifdef CONFIG_PM_ENABLE
-            schedule_light_sleep_enable();
-#endif
-            start_telemetry_task();
+            on_network_joined();
         }
         break;
     }
@@ -1051,10 +1192,7 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
                 ezb_nwk_get_current_channel(),
                 ezb_nwk_get_short_address()
             );
-#ifdef CONFIG_PM_ENABLE
-            schedule_light_sleep_enable();
-#endif
-            start_telemetry_task();
+            on_network_joined();
         } else {
             ESP_LOGW(TAG, "Zigbee network steering failed: 0x%02x", status);
             schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
