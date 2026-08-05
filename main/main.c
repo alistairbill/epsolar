@@ -5,9 +5,11 @@
 #include <stdint.h>
 
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_check.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #ifdef CONFIG_PM_ENABLE
@@ -38,7 +40,18 @@
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
-#define EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS 120000
+/* Cycles of silence from the telemetry task before the node restarts itself.
+ * Nothing else notices that it stopped: a Modbus transaction that never
+ * returns, a wake that never happens and a task that never runs all look
+ * identical from the outside, and on battery there is no console to see it
+ * on. esp_restart() keeps RTC RAM, so the counters below survive into the
+ * next boot line. */
+#define EPSOLAR_STALL_RESTART_CYCLES 3
+#if defined(CONFIG_PM_ENABLE) && defined(CONFIG_EPSOLAR_LIGHT_SLEEP)
+#define EPSOLAR_LIGHT_SLEEP_ENABLED true
+#else
+#define EPSOLAR_LIGHT_SLEEP_ENABLED false
+#endif
 #define RF_SWITCH_POWER_GPIO GPIO_NUM_3
 #define RF_SWITCH_SELECT_GPIO GPIO_NUM_14
 
@@ -62,15 +75,19 @@
 static const char *TAG = "epsolar_zigbee";
 static bool telemetry_task_started;
 
-/* Live counters sit in RTC RAM (survives light sleep, software resets and
- * panics) and are mirrored into NVS every EPSOLAR_DIAG_SAVE_CYCLES cycles so
- * they also survive an EN-pin reset or a power cycle, which drop RTC RAM.
- * This is the only readout channel once light sleep has killed USB Serial
- * JTAG: let it fail, reset the board, read the boot line. */
-#define EPSOLAR_DIAG_MAGIC 0x45505333U /* "EPS3" */
+/* Reading these back costs a power cycle: USB cannot be attached while the
+ * node runs on its own supply, and pulling that supply is a power-on reset,
+ * which is the one event RTC RAM does not survive. So NVS is the channel that
+ * matters and it is written every cycle; RTC RAM only carries the counters
+ * across the software restarts the node performs itself.
+ *
+ * Nothing is written to NVS at boot, and save_diagnostics() refuses to write
+ * at all while a USB host is present, so the snapshot of the failed run
+ * survives the boot that attaching the cable causes and every reset the
+ * monitor does after it. Readout is idempotent: reset as often as you like. */
+#define EPSOLAR_DIAG_MAGIC 0x45505335U /* "EPS5" */
 #define EPSOLAR_DIAG_NAMESPACE "epsolar"
 #define EPSOLAR_DIAG_KEY "diag"
-#define EPSOLAR_DIAG_SAVE_CYCLES 10
 
 /* Counters are bumped from both the telemetry task and the Zigbee stack task.
  * The increments are not atomic; a lost count in a diagnostic is cheaper than
@@ -86,6 +103,16 @@ typedef struct {
     uint32_t probe_streak;
     uint32_t announces;
     uint32_t rejoins;
+    uint32_t stall_restarts;
+    /* Reset reasons of the last four boots, most recent in the low byte. The
+     * live one is only ever seen by a console that was not attached when it
+     * mattered; this is how a brownout, a watchdog or a panic that happened
+     * hours ago still shows up in the next readout. */
+    uint32_t reset_reasons;
+    uint32_t light_sleeps;
+    uint64_t light_sleep_us;
+    uint32_t longest_light_sleep_ms;
+    uint32_t last_wakeup_causes;
     uint32_t last_publish_uptime_s;
     uint32_t last_confirm_uptime_s;
     uint32_t last_cycle_uptime_s;
@@ -102,6 +129,20 @@ static uint32_t uptime_seconds(void)
 
 static void save_diagnostics(void)
 {
+    /* A USB host means somebody is reading, not that the node is running: the
+     * supply has to be pulled before the cable goes in, so every readout
+     * starts a fresh boot, and idf.py monitor resets the board again on top of
+     * that. Either of those runs would otherwise overwrite the snapshot of the
+     * run being investigated before it had been read. Freeze it instead. */
+    if (usb_serial_jtag_is_connected()) {
+        static bool announced;
+        if (!announced) {
+            announced = true;
+            ESP_LOGW(TAG, "USB attached; retained diagnostics frozen for readout");
+        }
+        return;
+    }
+
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(EPSOLAR_DIAG_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
@@ -142,7 +183,7 @@ static void report_boot_diagnostics(void)
         previous = s_diag;
         source = "RTC RAM";
     } else if (load_diagnostics(&previous)) {
-        source = "NVS, up to 10 cycles stale";
+        source = "NVS, as of its last cycle";
     } else {
         previous = (epsolar_diag_t){0};
         source = NULL;
@@ -153,14 +194,17 @@ static void report_boot_diagnostics(void)
     } else {
         ESP_LOGW(
             TAG,
-            "Boot %" PRIu32 " (reset reason %d); previous run (%s): cycles=%" PRIu32
+            "Boot %" PRIu32 " (reset reason %d, history 0x%08" PRIx32
+            "); previous run (%s): cycles=%" PRIu32
             " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
             " report_confirms=%" PRIu32 " report_failures=%" PRIu32
             " last_probe_status=0x%02x announces=%" PRIu32 " rejoins=%" PRIu32
-            " last_cycle=%" PRIu32 "s last_publish=%" PRIu32 "s last_confirm=%" PRIu32
-            "s light_sleep=%d",
+            " stall_restarts=%" PRIu32 " last_cycle=%" PRIu32 "s last_publish=%" PRIu32
+            "s last_confirm=%" PRIu32 "s light_sleep=%d light_sleeps=%" PRIu32
+            " slept=%" PRIu32 "s longest_sleep=%" PRIu32 "ms wakeup_causes=0x%08" PRIx32,
             previous.boots + 1,
             reason,
+            previous.reset_reasons,
             source,
             previous.cycles,
             previous.modbus_failures,
@@ -170,51 +214,87 @@ static void report_boot_diagnostics(void)
             previous.last_probe_status,
             previous.announces,
             previous.rejoins,
+            previous.stall_restarts,
             previous.last_cycle_uptime_s,
             previous.last_publish_uptime_s,
             previous.last_confirm_uptime_s,
-            previous.light_sleep_enabled
+            previous.light_sleep_enabled,
+            previous.light_sleeps,
+            (uint32_t)(previous.light_sleep_us / 1000000U),
+            previous.longest_light_sleep_ms,
+            previous.last_wakeup_causes
         );
     }
 
     s_diag = (epsolar_diag_t){
         .magic = EPSOLAR_DIAG_MAGIC,
         .boots = previous.boots + 1,
+        .stall_restarts = previous.stall_restarts,
+        .reset_reasons = (previous.reset_reasons << 8) | (uint8_t)reason,
     };
-    save_diagnostics();
 }
 
+/* Automatic light sleep is armed from boot. Nothing has to hold it off while
+ * the node commissions: the Zigbee stack keeps an ESP_PM_NO_LIGHT_SLEEP lock
+ * for as long as the 802.15.4 radio is out of its sleep state, and the Modbus
+ * transactions take one of their own, so the only windows the chip can sleep
+ * in are the ones where it genuinely has nothing to do. A board that cannot
+ * survive sleeping is still recoverable: USB Serial JTAG holds the same lock
+ * the whole time a host is enumerating it, so plugging the cable in disables
+ * light sleep outright. */
 #ifdef CONFIG_PM_ENABLE
-static void configure_power_management(bool light_sleep_enable)
+static void configure_power_management(void)
 {
     esp_pm_config_t config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .light_sleep_enable = light_sleep_enable,
+        .light_sleep_enable = EPSOLAR_LIGHT_SLEEP_ENABLED,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&config));
+    s_diag.light_sleep_enabled = EPSOLAR_LIGHT_SLEEP_ENABLED;
 }
+#endif
 
-static void light_sleep_enable_task(void *arg)
+#if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+/* Runs in the idle task inside the tickless-idle critical section, once per
+ * automatic light sleep. Touch the RTC RAM counters and nothing else.
+ *
+ * These counters answer the only question the outside world cannot: whether
+ * the node is still waking up at all. Cycles that keep advancing while reports
+ * stop means the radio path died; cycles that stop with light_sleeps frozen
+ * means the chip never came back out of sleep.
+ *
+ * slept_us is zero when the framework decided the idle window was too short
+ * and skipped the sleep, which is not a wake. */
+static esp_err_t light_sleep_exited(int64_t slept_us, void *arg)
 {
-    vTaskDelay(pdMS_TO_TICKS(EPSOLAR_LIGHT_SLEEP_ENABLE_DELAY_MS));
-    configure_power_management(true);
-    s_diag.light_sleep_enabled = true;
-    save_diagnostics();
-    ESP_LOGI(TAG, "Automatic light sleep enabled");
-    vTaskDelete(NULL);
-}
-
-static void schedule_light_sleep_enable(void)
-{
-    static bool scheduled;
-    if (scheduled) {
-        return;
+    (void)arg;
+    if (slept_us <= 0) {
+        return ESP_OK;
     }
-    BaseType_t created = xTaskCreate(light_sleep_enable_task, "light_sleep", 2048, NULL, 3, NULL);
-    ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-    scheduled = true;
+    s_diag.light_sleeps++;
+    s_diag.light_sleep_us += (uint64_t)slept_us;
+    uint32_t slept_ms = (uint32_t)(slept_us / 1000);
+    if (slept_ms > s_diag.longest_light_sleep_ms) {
+        s_diag.longest_light_sleep_ms = slept_ms;
+    }
+    s_diag.last_wakeup_causes = esp_sleep_get_wakeup_causes();
+    return ESP_OK;
 }
+
+static void register_light_sleep_counters(void)
+{
+    esp_pm_sleep_cbs_register_config_t callbacks = {.exit_cb = light_sleep_exited};
+    ESP_ERROR_CHECK(esp_pm_light_sleep_register_cbs(&callbacks));
+}
+#endif
+
+#if !CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+static void register_light_sleep_counters(void) {}
+#endif
+
+#ifndef CONFIG_PM_ENABLE
+static void configure_power_management(void) {}
 #endif
 
 static void select_external_antenna(void)
@@ -1024,6 +1104,37 @@ static bool find_parent(ezb_nwk_neighbor_info_t *parent)
     return false;
 }
 
+static esp_timer_handle_t s_stall_timer;
+
+static void telemetry_stalled(void *arg)
+{
+    (void)arg;
+    s_diag.stall_restarts++;
+    ESP_LOGE(
+        TAG,
+        "No telemetry cycle for %" PRIu32 "s (cycles=%" PRIu32 " light_sleeps=%" PRIu32
+        " wakeup_causes=0x%08" PRIx32 "); restarting",
+        uptime_seconds() - s_diag.last_cycle_uptime_s,
+        s_diag.cycles,
+        s_diag.light_sleeps,
+        s_diag.last_wakeup_causes
+    );
+    esp_restart();
+}
+
+/* Re-armed at the end of every cycle, so the deadline only expires when cycles
+ * themselves stop. It is always further out than the next telemetry wake, so
+ * it never wakes the chip on its own. */
+static void arm_stall_watchdog(void)
+{
+    esp_timer_stop(s_stall_timer);
+    ESP_ERROR_CHECK(esp_timer_start_once(
+        s_stall_timer,
+        (uint64_t)EPSOLAR_STALL_RESTART_CYCLES * CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS
+            * 1000000ULL
+    ));
+}
+
 static void telemetry_task(void *arg)
 {
     epsolar_modbus_t modbus = {0};
@@ -1037,6 +1148,13 @@ static void telemetry_task(void *arg)
         );
         vTaskDelay(pdMS_TO_TICKS(EPSOLAR_MODBUS_INIT_RETRY_MS));
     }
+
+    const esp_timer_create_args_t stall_timer = {
+        .callback = telemetry_stalled,
+        .name = "epsolar_stall",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&stall_timer, &s_stall_timer));
+    arm_stall_watchdog();
 
     TickType_t last_wake = xTaskGetTickCount();
     while (true) {
@@ -1071,6 +1189,7 @@ static void telemetry_task(void *arg)
             " data_age=%" PRIu32 "s ack_age=%" PRIu32 "s"
             " modbus_fail=%" PRIu32 " publish_fail=%" PRIu32
             " probe_ok=%" PRIu32 " probe_fail=%" PRIu32 " rejoins=%" PRIu32
+            " sleeps=%" PRIu32 " slept=%" PRIu32 "s wake=0x%" PRIx32
             " joined=%d addr=0x%04x parent=0x%04x lqi=%u heap=%" PRIu32 "/%" PRIu32,
             s_diag.cycles,
             now,
@@ -1082,6 +1201,9 @@ static void telemetry_task(void *arg)
             s_diag.report_confirms,
             s_diag.report_failures,
             s_diag.rejoins,
+            s_diag.light_sleeps,
+            (uint32_t)(s_diag.light_sleep_us / 1000000U),
+            s_diag.last_wakeup_causes,
             joined,
             short_address,
             parented ? parent.short_addr : 0xffffU,
@@ -1090,9 +1212,12 @@ static void telemetry_task(void *arg)
             esp_get_minimum_free_heap_size()
         );
         check_link_health(joined);
-        if (s_diag.cycles % EPSOLAR_DIAG_SAVE_CYCLES == 0) {
-            save_diagnostics();
-        }
+        /* Every cycle. One blob rewrite a minute is nothing against NVS wear,
+         * and the counter that matters most - whether cycles kept running
+         * after the first light sleep - is only legible if the mirror outlives
+         * the sleep that stopped them. */
+        save_diagnostics();
+        arm_stall_watchdog();
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS * 1000U));
     }
 }
@@ -1115,9 +1240,6 @@ static void on_network_joined(void)
 {
     announce_presence_locked();
     s_link.last_repair_uptime_s = uptime_seconds();
-#ifdef CONFIG_PM_ENABLE
-    schedule_light_sleep_enable();
-#endif
     start_telemetry_task();
 }
 
@@ -1300,11 +1422,10 @@ void app_main(void)
 {
     select_external_antenna();
     initialize_nvs();
-#ifdef CONFIG_PM_ENABLE
-    configure_power_management(false);
-#endif
     ESP_LOGI(TAG, "Starting ESP32-C6 EPSolar Zigbee sensor");
     report_boot_diagnostics();
+    configure_power_management();
+    register_light_sleep_counters();
     ESP_ERROR_CHECK(
         xTaskCreate(zigbee_task, "zigbee_main", 6144, NULL, 5, NULL) == pdPASS
             ? ESP_OK

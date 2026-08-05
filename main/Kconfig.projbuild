@@ -7,6 +7,18 @@ config EPSOLAR_UPDATE_INTERVAL_SECONDS
     help
         Time between Modbus reads and Zigbee attribute updates.
 
+config EPSOLAR_LIGHT_SLEEP
+    bool "Enable automatic light sleep"
+    depends on PM_ENABLE && FREERTOS_USE_TICKLESS_IDLE
+    default y
+    help
+        Sleep between telemetry cycles. The Zigbee stack and the Modbus
+        transactions hold the chip awake whenever they need it, so this only
+        covers genuinely idle time. Turn it off for the reference run when
+        bisecting a fault that only appears on battery: light sleep never
+        happens while USB is attached, because USB Serial JTAG holds a
+        no-light-sleep lock for as long as a host is enumerating it.
+
 config EPSOLAR_MODBUS_UART_PORT
     int "Modbus UART port"
     range 0 1
