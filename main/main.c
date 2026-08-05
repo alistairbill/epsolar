@@ -88,6 +88,8 @@ static bool telemetry_task_started;
 #define EPSOLAR_DIAG_MAGIC 0x45505335U /* "EPS5" */
 #define EPSOLAR_DIAG_NAMESPACE "epsolar"
 #define EPSOLAR_DIAG_KEY "diag"
+#define EPSOLAR_DIAG_DENSE_CYCLES 30
+#define EPSOLAR_DIAG_SAVE_CYCLES 10
 
 /* Counters are bumped from both the telemetry task and the Zigbee stack task.
  * The increments are not atomic; a lost count in a diagnostic is cheaper than
@@ -1212,11 +1214,15 @@ static void telemetry_task(void *arg)
             esp_get_minimum_free_heap_size()
         );
         check_link_health(joined);
-        /* Every cycle. One blob rewrite a minute is nothing against NVS wear,
-         * and the counter that matters most - whether cycles kept running
-         * after the first light sleep - is only legible if the mirror outlives
-         * the sleep that stopped them. */
-        save_diagnostics();
+        /* Dense while a run is young, sparse once it has proven itself. Every
+         * failure this node has had arrived in the first few minutes, which is
+         * exactly where a ten-cycle mirror is blind; past that the counters are
+         * cumulative, so a later readout loses at most the last few minutes and
+         * the flash stops being rewritten once a minute forever. */
+        if (s_diag.cycles <= EPSOLAR_DIAG_DENSE_CYCLES
+            || s_diag.cycles % EPSOLAR_DIAG_SAVE_CYCLES == 0) {
+            save_diagnostics();
+        }
         arm_stall_watchdog();
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS * 1000U));
     }

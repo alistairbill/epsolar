@@ -8,8 +8,18 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# A sleepy end device lives or dies on the 35-40 ms receive window that follows
+# each poll, and 10 ms of tick quantisation on both ends of a light sleep does
+# not fit inside it. 1000 is what the esp-zigbee-sdk light_sleep_end_device
+# reference uses. Ticks are suppressed while asleep, so the faster tick only
+# costs during the awake slices.
+CONFIG_FREERTOS_HZ=1000
 CONFIG_IEEE802154_SLEEP_ENABLE=y
 CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=y
-CONFIG_ESP_SLEEP_POWER_DOWN_FLASH=y
+# Powering flash down races its own wake-up: the power-down takes time, an early
+# wake re-powers the part mid-sequence, and the IDF sleep documentation says
+# plainly that it is then not guaranteed to work. ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND
+# is the supported way to get most of the saving without the race.
+# CONFIG_ESP_SLEEP_POWER_DOWN_FLASH is not set
 CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
