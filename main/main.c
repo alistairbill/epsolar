@@ -78,8 +78,9 @@ static bool telemetry_task_started;
 /* Reading these back costs a power cycle: USB cannot be attached while the
  * node runs on its own supply, and pulling that supply is a power-on reset,
  * which is the one event RTC RAM does not survive. So NVS is the channel that
- * matters and it is written every cycle; RTC RAM only carries the counters
- * across the software restarts the node performs itself.
+ * matters. RTC RAM adds nothing across a light sleep - all of SRAM survives
+ * one - and carries the counters only across the software restarts the node
+ * performs itself, where .bss would have been zeroed.
  *
  * Nothing is written to NVS at boot, and save_diagnostics() refuses to write
  * at all while a USB host is present, so the snapshot of the failed run
