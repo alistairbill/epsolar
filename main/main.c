@@ -37,6 +37,11 @@
 #define EPSOLAR_LINK_STALL_S 600
 #define EPSOLAR_LINK_REPAIR_ATTEMPTS 3
 #define EPSOLAR_REJOIN_BACKOFF_S 300
+/* Upper bound on how long one telemetry cycle's Modbus read, report burst and
+ * APS ack exchange may hold off light sleep. The probe's confirm - success,
+ * or 0xa7 once the APS retries exhaust - normally closes the window well
+ * inside this; the timeout only covers a confirm that never comes. */
+#define EPSOLAR_REPORT_WINDOW_TIMEOUT_MS 15000
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
@@ -251,6 +256,71 @@ static void report_boot_diagnostics(void)
  * reference run by definition. The stack's own locks still cover
  * commissioning, the radio and the Modbus transactions on unattended runs. */
 #ifdef CONFIG_PM_ENABLE
+/* A sleepy end device receives nothing except in the short receive window
+ * that follows one of its own MAC polls, and an APS-acknowledged frame is
+ * only complete once the ack has been fetched that way: the coordinator's
+ * ack rides back as an indirect transmission the parent holds for 7.68 s,
+ * and the stack is supposed to short-poll until it lands. Under automatic
+ * light sleep that phase is exactly what failed in the field - attribute
+ * writes and transmissions succeeded, and every APSDE-DATA.confirm came back
+ * 0xa7 "no APS ack", so the chip was sleeping through or mistiming its own
+ * ack polls. Take that decision away from the stack: hold
+ * ESP_PM_NO_LIGHT_SLEEP from the top of each telemetry cycle until the link
+ * probe's confirm arrives (either way) or a failsafe timeout fires, so the
+ * Modbus transaction, the report burst and the ack exchange all run on a
+ * chip that stays awake, and the node sleeps only the quiet remainder of
+ * the minute. Costs a few seconds of awake time per cycle; buys delivery. */
+static esp_pm_lock_handle_t s_report_window_lock;
+static esp_timer_handle_t s_report_window_timer;
+static portMUX_TYPE s_report_window_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_report_window_held;
+
+static void close_report_window(void)
+{
+    if (s_report_window_lock == NULL) {
+        return;
+    }
+    esp_timer_stop(s_report_window_timer);
+    bool release = false;
+    portENTER_CRITICAL(&s_report_window_mux);
+    if (s_report_window_held) {
+        s_report_window_held = false;
+        release = true;
+    }
+    portEXIT_CRITICAL(&s_report_window_mux);
+    if (release) {
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_report_window_lock));
+    }
+}
+
+static void report_window_timeout(void *arg)
+{
+    (void)arg;
+    close_report_window();
+}
+
+static void open_report_window(void)
+{
+    if (s_report_window_lock == NULL) {
+        return;
+    }
+    bool acquire = false;
+    portENTER_CRITICAL(&s_report_window_mux);
+    if (!s_report_window_held) {
+        s_report_window_held = true;
+        acquire = true;
+    }
+    portEXIT_CRITICAL(&s_report_window_mux);
+    if (acquire) {
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_report_window_lock));
+    }
+    esp_timer_stop(s_report_window_timer);
+    ESP_ERROR_CHECK(esp_timer_start_once(
+        s_report_window_timer,
+        (uint64_t)EPSOLAR_REPORT_WINDOW_TIMEOUT_MS * 1000ULL
+    ));
+}
+
 static void configure_power_management(void)
 {
     bool light_sleep = EPSOLAR_LIGHT_SLEEP_ENABLED;
@@ -265,6 +335,16 @@ static void configure_power_management(void)
     };
     ESP_ERROR_CHECK(esp_pm_configure(&config));
     s_diag.light_sleep_enabled = light_sleep;
+    if (light_sleep) {
+        ESP_ERROR_CHECK(esp_pm_lock_create(
+            ESP_PM_NO_LIGHT_SLEEP, 0, "epsolar_report", &s_report_window_lock
+        ));
+        const esp_timer_create_args_t window_timer = {
+            .callback = report_window_timeout,
+            .name = "epsolar_report_window",
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&window_timer, &s_report_window_timer));
+    }
 }
 #endif
 
@@ -308,6 +388,8 @@ static void register_light_sleep_counters(void) {}
 
 #ifndef CONFIG_PM_ENABLE
 static void configure_power_management(void) {}
+static void open_report_window(void) {}
+static void close_report_window(void) {}
 #endif
 
 static void select_external_antenna(void)
@@ -941,6 +1023,10 @@ static struct {
 static void link_probe_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
 {
     (void)user_ctx;
+    /* The confirm is the end of the cycle's ack exchange whichever way it
+     * went: success, or 0xa7 after the stack's APS retries have exhausted.
+     * Either way there is nothing left to stay awake for. */
+    close_report_window();
     s_diag.last_probe_status = cnf->status;
     if (cnf->status == 0) {
         s_diag.report_confirms++;
@@ -997,6 +1083,9 @@ static void send_link_probe(void)
         s_diag.report_failures++;
         s_diag.probe_streak++;
         ESP_LOGW(TAG, "Link probe rejected by the stack: 0x%04x", err);
+        /* No frame in flight means no confirm will ever close the window;
+         * the stack's own locks cover whatever is still draining. */
+        close_report_window();
     }
 }
 
@@ -1172,6 +1261,7 @@ static void telemetry_task(void *arg)
     TickType_t last_wake = xTaskGetTickCount();
     while (true) {
         epsolar_telemetry_t telemetry;
+        open_report_window();
         err = epsolar_read_telemetry(&modbus, &telemetry);
         s_diag.cycles++;
         s_diag.last_cycle_uptime_s = uptime_seconds();
