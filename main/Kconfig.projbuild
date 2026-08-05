@@ -14,10 +14,12 @@ config EPSOLAR_LIGHT_SLEEP
     help
         Sleep between telemetry cycles. The Zigbee stack and the Modbus
         transactions hold the chip awake whenever they need it, so this only
-        covers genuinely idle time. Turn it off for the reference run when
-        bisecting a fault that only appears on battery: light sleep never
-        happens while USB is attached, because USB Serial JTAG holds a
-        no-light-sleep lock for as long as a host is enumerating it.
+        covers genuinely idle time. The firmware checks for a USB host once
+        at boot and keeps light sleep off for that whole run when one is
+        present: USB Serial JTAG does not survive a light sleep, and the USJ
+        connection monitor's own no-light-sleep lock is not reliable at
+        1000 Hz ticks. Turn this off outright to force the same no-sleep
+        reference behaviour on battery as well.
 
 config EPSOLAR_MODBUS_UART_PORT
     int "Modbus UART port"

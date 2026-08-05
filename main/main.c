@@ -237,24 +237,34 @@ static void report_boot_diagnostics(void)
     };
 }
 
-/* Automatic light sleep is armed from boot. Nothing has to hold it off while
- * the node commissions: the Zigbee stack keeps an ESP_PM_NO_LIGHT_SLEEP lock
- * for as long as the 802.15.4 radio is out of its sleep state, and the Modbus
- * transactions take one of their own, so the only windows the chip can sleep
- * in are the ones where it genuinely has nothing to do. A board that cannot
- * survive sleeping is still recoverable: USB Serial JTAG holds the same lock
- * the whole time a host is enumerating it, so plugging the cable in disables
- * light sleep outright. */
+/* Automatic light sleep is armed from boot, but only on an unattended boot.
+ * The USJ connection monitor's ESP_PM_NO_LIGHT_SLEEP lock cannot be trusted
+ * to keep an attached console alive at CONFIG_FREERTOS_HZ=1000: the monitor
+ * samples the host's 1 kHz SOF stream from the 1 kHz tick hook, and its
+ * three-tick no-SOF tolerance is spent one slip at a time - it only
+ * replenishes on a disconnect/reconnect transition - so ordinary drift
+ * between the two clocks exhausts it within minutes, the lock drops, and
+ * tickless idle sleeps inside the millisecond before the status could
+ * recover. USB Serial JTAG does not survive a light sleep, so that is the
+ * end of the console, of esptool and of the run. Decide at boot instead: a
+ * USB host present means somebody is watching, which is the no-sleep
+ * reference run by definition. The stack's own locks still cover
+ * commissioning, the radio and the Modbus transactions on unattended runs. */
 #ifdef CONFIG_PM_ENABLE
 static void configure_power_management(void)
 {
+    bool light_sleep = EPSOLAR_LIGHT_SLEEP_ENABLED;
+    if (light_sleep && usb_serial_jtag_is_connected()) {
+        light_sleep = false;
+        ESP_LOGW(TAG, "USB host attached at boot; automatic light sleep disabled for this run");
+    }
     esp_pm_config_t config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .light_sleep_enable = EPSOLAR_LIGHT_SLEEP_ENABLED,
+        .light_sleep_enable = light_sleep,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&config));
-    s_diag.light_sleep_enabled = EPSOLAR_LIGHT_SLEEP_ENABLED;
+    s_diag.light_sleep_enabled = light_sleep;
 }
 #endif
 
