@@ -44,7 +44,8 @@
 #define EPSOLAR_REPORT_WINDOW_TIMEOUT_MS 15000
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
-#define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 32
+/* Hold out for a parent with some link margin, not one at the edge of hearing. */
+#define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 40
 /* Cycles of silence from the telemetry task before the node restarts itself.
  * Nothing else notices that it stopped: a Modbus transaction that never
  * returns, a wake that never happens and a task that never runs all look
@@ -242,19 +243,8 @@ static void report_boot_diagnostics(void)
     };
 }
 
-/* Automatic light sleep is armed from boot, but only on an unattended boot.
- * The USJ connection monitor's ESP_PM_NO_LIGHT_SLEEP lock cannot be trusted
- * to keep an attached console alive at CONFIG_FREERTOS_HZ=1000: the monitor
- * samples the host's 1 kHz SOF stream from the 1 kHz tick hook, and its
- * three-tick no-SOF tolerance is spent one slip at a time - it only
- * replenishes on a disconnect/reconnect transition - so ordinary drift
- * between the two clocks exhausts it within minutes, the lock drops, and
- * tickless idle sleeps inside the millisecond before the status could
- * recover. USB Serial JTAG does not survive a light sleep, so that is the
- * end of the console, of esptool and of the run. Decide at boot instead: a
- * USB host present means somebody is watching, which is the no-sleep
- * reference run by definition. The stack's own locks still cover
- * commissioning, the radio and the Modbus transactions on unattended runs. */
+/* Decide once at boot: a USB host present means the no-sleep reference run,
+ * and USB Serial JTAG does not survive a light sleep. */
 #ifdef CONFIG_PM_ENABLE
 /* A sleepy end device receives nothing except in the short receive window
  * that follows one of its own MAC polls, and an APS-acknowledged frame is
@@ -1440,6 +1430,8 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
 
     case EZB_NWK_SIGNAL_NETWORK_STATUS: {
         const ezb_nwk_signal_network_status_params_t *nwk = ezb_app_signal_get_params(signal);
+        /* First sync-loss report; informational. Polling continues, and a
+         * parent that is truly gone escalates to NO_ACTIVE_LINKS_LEFT. */
         ESP_LOGW(
             TAG,
             "Zigbee network status 0x%02x (%s) reported by 0x%04x",
@@ -1447,9 +1439,6 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             ezb_nwk_network_status_to_string(nwk->status),
             nwk->network_addr
         );
-        if (nwk->status == EZB_NWK_NETWORK_STATUS_PARENT_LINK_FAILURE) {
-            request_rejoin("parent link failure");
-        }
         break;
     }
 
