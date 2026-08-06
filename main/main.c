@@ -33,10 +33,24 @@
  * window, and the window restarts on every repair, so no repair is judged on
  * silence it never had the chance to break: the restart at the end of the
  * ladder needs EPSOLAR_LINK_STALL_S * (EPSOLAR_LINK_REPAIR_ATTEMPTS + 1) of
- * uninterrupted silence. */
-#define EPSOLAR_LINK_STALL_S 600
+ * uninterrupted silence.
+ *
+ * The window was 600 s, and at that setting the ladder has never once run. A
+ * light-sleep-disabled run lost its acks after 22 confirmed cycles and spent
+ * its remaining eight cycles at 0xa7 before the node stopped altogether -
+ * 480 s of silence against a 600 s threshold, so the first announce was still
+ * two minutes away when the run ended. Every repair this ladder exists to
+ * perform has so far been theoretical. Three consecutive unacknowledged probes
+ * is already a hard signal, since each probe has the APS retries underneath it,
+ * and the whole ladder now completes in twelve minutes rather than forty.
+ *
+ * The rejoin backoff has to stay under the stall window or it paces the ladder
+ * instead of the ladder pacing itself: at 300 s against a 180 s window the
+ * stage-1 rejoin would be refused, repair_stage would not advance, and the
+ * escalation would stall on a step it never took. */
+#define EPSOLAR_LINK_STALL_S 180
 #define EPSOLAR_LINK_REPAIR_ATTEMPTS 3
-#define EPSOLAR_REJOIN_BACKOFF_S 300
+#define EPSOLAR_REJOIN_BACKOFF_S 150
 /* Upper bound on how long one telemetry cycle's Modbus read, report burst and
  * APS ack exchange may hold off light sleep. The probe's confirm - success,
  * or 0xa7 once the APS retries exhaust - normally closes the window well

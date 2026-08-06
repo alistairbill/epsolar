@@ -57,10 +57,11 @@ Order matters. The board reboots; that boot is the run under test.
 
 Watch zigbee2mqtt. Two outcomes:
 
-- **Reports stop.** Note roughly when. Give it another 45 minutes before you
-  touch it — the repair ladder needs 40 minutes of silence before it restarts
-  the node, and the stall watchdog restarts it after 3 missed cycles, so leaving
-  it alone lets those attempts record themselves.
+- **Reports stop.** Note roughly when. Give it another 20 minutes before you
+  touch it — the repair ladder announces after 3 minutes of silence and restarts
+  the node after 12, and the stall watchdog restarts it after 3 missed cycles,
+  so leaving it alone lets those attempts record themselves in `announces`,
+  `rejoins` and `stall_restarts`.
 - **Reports keep coming.** Leave it for **several days**, not ten minutes. The
   time constants here are long: `ed_timeout` is 8 minutes, rejoin backoff is 5
   minutes, the repair ladder is 40. A fix that survives one afternoon has not
