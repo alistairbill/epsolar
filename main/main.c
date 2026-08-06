@@ -1482,6 +1482,16 @@ static void start_telemetry_task(void)
 static void on_network_joined(void)
 {
     announce_presence_locked();
+    /* Read again after commissioning: what the stack accepted before start is
+     * not evidence that it survived a join, and a keepalive quietly reset
+     * during commissioning would look exactly like the config field never
+     * having worked. */
+    ESP_LOGW(
+        TAG,
+        "SED poll configuration after join: keepalive=%" PRIu32 "ms fast_poll=%" PRIu32 "ms",
+        ezb_nwk_get_keepalive_interval(),
+        ezb_nwk_get_fast_poll_interval()
+    );
     s_link.last_repair_uptime_s = uptime_seconds();
     start_telemetry_task();
 }
@@ -1630,6 +1640,28 @@ static void zigbee_task(void *arg)
             : ESP_FAIL
     );
     ezb_nwk_set_rx_on_when_idle(false);
+    /* Set again through the runtime setter, having already been passed as
+     * zed_config.keep_alive to esp_zigbee_init() above. The node was observed
+     * waking roughly ten times a second between telemetry cycles - 662 light
+     * sleeps in 65 idle seconds, none longer than 99 ms - which is two wakes
+     * per 200 ms, the documented default fast poll interval, sustained
+     * indefinitely. A sleepy end device is supposed to fast poll only long
+     * enough to collect the APS ack for something it just sent and then fall
+     * back to its keepalive; this one never falls back. Whether the config
+     * field reaches the stack at all is the cheaper of the two explanations to
+     * eliminate, so assert the interval explicitly and log what the stack
+     * actually holds. */
+    uint32_t keepalive_from_config = ezb_nwk_get_keepalive_interval();
+    ezb_nwk_set_keepalive_interval(EPSOLAR_ZIGBEE_KEEP_ALIVE_MS);
+    ESP_LOGW(
+        TAG,
+        "SED poll configuration: keepalive %" PRIu32 "ms from zed_config, %" PRIu32
+        "ms after setting it explicitly (asked for %ums); fast_poll=%" PRIu32 "ms",
+        keepalive_from_config,
+        ezb_nwk_get_keepalive_interval(),
+        (unsigned)EPSOLAR_ZIGBEE_KEEP_ALIVE_MS,
+        ezb_nwk_get_fast_poll_interval()
+    );
     ezb_aps_secur_enable_distributed_security(false);
     ezb_nwk_set_min_join_lqi(EPSOLAR_ZIGBEE_MIN_JOIN_LQI);
     ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(EZB_RADIO_2P4GHZ_ALL_CHANNEL_MASK));
