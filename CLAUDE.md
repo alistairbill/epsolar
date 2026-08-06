@@ -123,6 +123,12 @@ address and downlink still routes to the old parent) → rejoin via BDB network 
 
 Light sleep is the fragile part; read `DEBUGGING.md` before changing anything here.
 
+- `s_startup_lock` holds `ESP_PM_NO_LIGHT_SLEEP` from the moment light sleep is armed
+  until the first telemetry cycle completes. Stack bring-up was otherwise entirely
+  unguarded — `app_main` returns as soon as `zigbee_task` is created, the report window
+  doesn't open until the first cycle, and the Modbus lock is per transaction — so the idle
+  task could sleep the chip during `esp_zigbee_init()`. There is deliberately **no failsafe
+  timeout**: a node that hasn't completed a cycle hasn't shown it survives a sleep.
 - The whole telemetry cycle is bracketed by `open_report_window()` /
   `close_report_window()`, an `ESP_PM_NO_LIGHT_SLEEP` lock held from the Modbus read
   until the probe's APS confirm arrives (either outcome) or

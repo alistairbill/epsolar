@@ -399,6 +399,36 @@ static void open_report_window(void)
     ));
 }
 
+/* Held from the moment light sleep is armed until the node has completed one
+ * telemetry cycle, and never re-taken.
+ *
+ * Bringing the Zigbee stack up is the one stretch of a boot where nothing at
+ * all holds a lock: the report window does not open until the first telemetry
+ * cycle, the Modbus lock is per transaction, and app_main returns as soon as
+ * zigbee_task is created, so the idle task is free to sleep the chip while
+ * esp_zigbee_init() and esp_zigbee_start() are still bringing up the radio.
+ * A battery run stopped there - stage 1 reached at 0s, stage 2 never recorded -
+ * while the identical code path on USB, where light sleep is off, walks through
+ * it in under three seconds every time.
+ *
+ * There is deliberately no failsafe timeout. A node that has not completed a
+ * cycle has not shown it can survive a sleep, and releasing the lock on it is
+ * how it disappears; holding it costs current on a node that is already broken,
+ * and keeps it awake enough for the stall watchdog to restart it. */
+static esp_pm_lock_handle_t s_startup_lock;
+
+static void release_startup_lock(void)
+{
+    if (s_startup_lock == NULL) {
+        return;
+    }
+    esp_pm_lock_handle_t lock = s_startup_lock;
+    s_startup_lock = NULL;
+    ESP_ERROR_CHECK(esp_pm_lock_release(lock));
+    ESP_ERROR_CHECK(esp_pm_lock_delete(lock));
+    ESP_LOGI(TAG, "First cycle complete; automatic light sleep released");
+}
+
 static void configure_power_management(void)
 {
     bool light_sleep = EPSOLAR_LIGHT_SLEEP_ENABLED;
@@ -414,6 +444,10 @@ static void configure_power_management(void)
     ESP_ERROR_CHECK(esp_pm_configure(&config));
     s_diag.light_sleep_enabled = light_sleep;
     if (light_sleep) {
+        ESP_ERROR_CHECK(esp_pm_lock_create(
+            ESP_PM_NO_LIGHT_SLEEP, 0, "epsolar_startup", &s_startup_lock
+        ));
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_startup_lock));
         ESP_ERROR_CHECK(esp_pm_lock_create(
             ESP_PM_NO_LIGHT_SLEEP, 0, "epsolar_report", &s_report_window_lock
         ));
@@ -468,6 +502,7 @@ static void register_light_sleep_counters(void) {}
 static void configure_power_management(void) {}
 static void open_report_window(void) {}
 static void close_report_window(void) {}
+static void release_startup_lock(void) {}
 #endif
 
 static void select_external_antenna(void)
@@ -1423,6 +1458,9 @@ static void telemetry_task(void *arg)
             save_diagnostics();
         }
         arm_stall_watchdog();
+        /* Idempotent, so this is simply "a cycle finished" rather than a first
+         * iteration special case. Until one has, the chip stays awake. */
+        release_startup_lock();
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS * 1000U));
     }
 }

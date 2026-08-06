@@ -117,7 +117,7 @@ reading, and `stage` is the only thing that says where it stopped:
 
 | `stage` | Reached | So it died in |
 |---|---|---|
-| 1 | power configured | the Zigbee stack init, or `register_device()` |
+| 1 | power configured | the Zigbee stack init, or `register_device()` — see below |
 | 2 | Zigbee started | commissioning — it never joined |
 | 3 | joined | `epsolar_modbus_init()`, which retries forever on failure |
 | 4 | Modbus ready | the first Modbus read or publish |
@@ -127,6 +127,15 @@ transaction is what hangs. `stage=3` that never advances means Modbus init is
 failing in a loop — on external power, with no console to say so. The stall
 watchdog covers that loop, so `stage=3` with `stall_restarts` climbing is the
 signature: it is retrying, failing, and being restarted every three intervals.
+
+`stage=1` that never advances means the node never got the Zigbee stack
+started. This was observed on battery — stage 1 at 0s, stage 2 never recorded,
+`light_sleep=1` — while the identical path on USB completes in under three
+seconds. Bringing the stack up was the one stretch of a boot with no PM lock
+held anywhere, so the idle task could sleep the chip mid-radio-init;
+`s_startup_lock` now holds it awake from boot until the first completed cycle.
+A `stage=1` after that fix means something other than sleep, and the supply is
+the next suspect.
 
 Note the one gap the watchdog still does not cover: a node that never joins
 never starts the telemetry task, so nothing restarts it. That case shows as
