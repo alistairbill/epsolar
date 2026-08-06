@@ -35,19 +35,11 @@
  * ladder needs EPSOLAR_LINK_STALL_S * (EPSOLAR_LINK_REPAIR_ATTEMPTS + 1) of
  * uninterrupted silence.
  *
- * The window was 600 s, and at that setting the ladder has never once run. A
- * light-sleep-disabled run lost its acks after 22 confirmed cycles and spent
- * its remaining eight cycles at 0xa7 before the node stopped altogether -
- * 480 s of silence against a 600 s threshold, so the first announce was still
- * two minutes away when the run ended. Every repair this ladder exists to
- * perform has so far been theoretical. Three consecutive unacknowledged probes
- * is already a hard signal, since each probe has the APS retries underneath it,
- * and the whole ladder now completes in twelve minutes rather than forty.
- *
- * The rejoin backoff has to stay under the stall window or it paces the ladder
- * instead of the ladder pacing itself: at 300 s against a 180 s window the
- * stage-1 rejoin would be refused, repair_stage would not advance, and the
- * escalation would stall on a step it never took. */
+ * Three cycles is enough to act on: each probe already carries the APS retries
+ * underneath it, so three unacknowledged in a row is a dead link rather than a
+ * flap. The rejoin backoff must stay below the stall window, or a rejoin is
+ * refused for being too soon, repair_stage never advances, and the ladder
+ * stalls on a step it never took. */
 #define EPSOLAR_LINK_STALL_S 180
 #define EPSOLAR_LINK_REPAIR_ATTEMPTS 3
 #define EPSOLAR_REJOIN_BACKOFF_S 150
@@ -58,33 +50,18 @@
 #define EPSOLAR_REPORT_WINDOW_TIMEOUT_MS 15000
 /* The long poll interval: how often the node polls its parent when it is not
  * fast polling. esp_zb_set_default_long_poll_interval() is a macro over the
- * keepalive setter, so the two names are the same knob. It is very nearly
- * decorative here, because the node never leaves fast poll to use it.
- *
- * Fixed, and paired with the 8 minute ed_timeout below. Raising it is the
- * workaround circulating for espressif/esp-zigbee-sdk#782, and it does not
- * apply here: that device is idle and wedges when its long poll first fires,
- * whereas this one transmits every cycle and its own traffic starts fast poll
- * regardless. Its light sleeps have never once exceeded 99 ms, from the first
- * cycle onwards, so nothing here waited for a long poll boundary to go wrong.
- * Anything much above the ed_timeout would also get the node aged out by its
- * parent, so the two move together or not at all. */
+ * keepalive setter, so the two names are the same knob. It must stay well
+ * inside the ed_timeout below, or the parent ages the node out between polls. */
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
-/* Slow fast poll down rather than trying to escape it.
+/* The library defaults this to 200 ms and never falls back to the long poll
+ * interval above (espressif/esp-zigbee-sdk#782, #215), so in practice it sets
+ * the idle wake rate: two wakes per interval, indefinitely.
  *
- * The library defaults this to 200 ms and never falls back to the long poll
- * interval above - a known, still open defect, reported on this exact board in
- * espressif/esp-zigbee-sdk#782 and again in #215. Two wakes per period means
- * about ten a second, indefinitely, and that is where this node's idle power
- * goes.
- *
- * Escaping fast poll properly was tried and is not available: stopping it costs
- * the node the only receive window it has, every probe after the stop failed,
- * and the stack thrashed on retries instead of sleeping. So the interval is the
- * lever, and it is a Kconfig option because the useful value has to be found by
- * walking it up against probe_ok/probe_fail rather than argued from first
- * principles. The ceiling in the range is the parent's
- * macTransactionPersistenceTime of 7.68 s; see the help text. */
+ * Fast poll cannot simply be stopped. It is the only receive window a sleepy
+ * end device has, and without it the APS ack is discarded by the parent after
+ * macTransactionPersistenceTime, 7.68 s, long before a 60 s long poll comes
+ * round. So the interval is the only lever, and it is configurable because the
+ * usable value has to be found by walking it up against probe_ok/probe_fail. */
 #define EPSOLAR_ZIGBEE_FAST_POLL_MS CONFIG_EPSOLAR_ZIGBEE_FAST_POLL_MS
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 /* Hold out for a parent with some link margin, not one at the edge of hearing. */
@@ -124,22 +101,11 @@
 static const char *TAG = "epsolar_zigbee";
 static bool telemetry_task_started;
 
-/* The poll interval manager, which no public header exposes. Signature read off
- * the disassembly, since nothing declares it: it touches a0 only to return
- * through it, so it takes no argument, and the result is taken as int rather
- * than bool so nothing depends on the callee having narrowed it. A future
- * release that drops the symbol breaks the link, which is the right way for
- * this to fail.
- *
- * Only the predicate is used. nwk_pim_stop_fast_poll() was called from
- * link_probe_confirm() on the reasoning that the confirm marks the end of the
- * exchange and the stack would start fast poll again by itself next cycle. It
- * does not. Cycle 1 confirmed, the stop ran, and all four subsequent probes
- * failed - and the node then barely slept at all, one sleep of 29 ms in 243 s,
- * because a stack that cannot complete its APS transactions retries instead of
- * going idle. Stopping fast poll costs the node its only receive window: the
- * parent discards an indirect transaction after macTransactionPersistenceTime,
- * 7.68 s, and a node back on a 60 s long poll never comes to collect it. */
+/* Poll interval manager internal; no public header declares it. The signature
+ * is taken from the disassembly - it touches a0 only to return through it, so
+ * it takes no argument - and the result is int rather than bool so nothing
+ * depends on the callee having narrowed it. A release that drops the symbol
+ * breaks the link, which is the right way for this to fail. */
 extern int nwk_pim_is_fast_poll_running(void);
 
 /* Reading these back costs a power cycle: USB cannot be attached while the
@@ -156,12 +122,11 @@ extern int nwk_pim_is_fast_poll_running(void);
  * added to the save path has to go through save_diagnostics_to(). */
 #define EPSOLAR_DIAG_MAGIC 0x45505336U /* "EPS6" */
 #define EPSOLAR_DIAG_NAMESPACE "epsolar"
-/* Two records, because one of them kept destroying the other. The run record is
- * written only from the cycle loop, so it always describes a run that got as far
- * as producing telemetry; the boot record is stamped as the current boot passes
- * each milestone. Sharing a key meant a boot that died early overwrote the last
- * good run with a cycles=0 stub - which is exactly what happened to the first
- * external-power snapshot this black box was built to catch. */
+/* Two records, and they must not share a key. The run record is written only
+ * from the cycle loop, so it always describes a run that produced telemetry;
+ * the boot record is stamped as the current boot passes each milestone. Shared,
+ * a boot that died early would overwrite the last good run with a cycles=0
+ * stub. */
 #define EPSOLAR_DIAG_RUN_KEY "diag"
 #define EPSOLAR_DIAG_BOOT_KEY "boot"
 #define EPSOLAR_DIAG_DENSE_CYCLES 30
@@ -328,21 +293,13 @@ static void log_previous_run(const char *source, const epsolar_diag_t *previous)
     );
 }
 
-/* Report both sources, never whichever one happens to be valid.
- *
- * A USB reset - reset reason 11, which is what idf.py monitor performs when it
- * opens the port - keeps RTC RAM. So the readout sequence poisons its own
- * evidence: attaching the cable is a power-on reset that wipes RTC RAM and
- * reads NVS, but that boot line is emitted while the port is still enumerating
- * and nobody sees it; the monitor then resets over USB, RTC RAM survives from
- * the few seconds the board was up, and every boot from then on reports that
- * stub run in preference to the field run sitting in NVS. Reset as often as
- * you like was true of the stored snapshot and false of what got printed.
- *
- * The two sources answer different questions and neither substitutes for the
- * other: RTC RAM is the more recent, and is the only record of a run the node
- * ended itself with esp_restart(); NVS is frozen while USB is attached and is
- * therefore the only record of a run on external power. Print both. */
+/* Report every source rather than whichever happens to be valid, because they
+ * routinely describe different runs and each answers something the others
+ * cannot. RTC RAM is the most recent and the only record of a run the node
+ * ended itself with esp_restart(), but a USB reset - reset reason 11, which is
+ * what idf.py monitor performs on opening the port - preserves it, so during a
+ * readout it describes the readout. NVS is frozen while USB is attached and is
+ * therefore the only record of a run on external power. */
 static void report_boot_diagnostics(void)
 {
     esp_reset_reason_t reason = esp_reset_reason();
@@ -369,9 +326,8 @@ static void report_boot_diagnostics(void)
     if (!have_retained && !have_run && !have_boot) {
         ESP_LOGI(TAG, "Boot 1 (reset reason %d); no retained diagnostics", reason);
     } else {
-        /* One boot number, stated once. Each record then names the run it
-         * describes, because they are routinely different runs and printing a
-         * "Boot N" per record invited reading a readout stub as the field run. */
+        /* One boot number, stated once; each record then names the run it
+         * describes, since they are routinely different runs. */
         ESP_LOGW(TAG, "Boot %" PRIu32 " (reset reason %d); retained diagnostics:", previous.boots + 1, reason);
         if (have_retained) {
             log_previous_run("RTC RAM", &retained);
@@ -463,19 +419,15 @@ static void open_report_window(void)
 /* Held from the moment light sleep is armed until the node has completed one
  * telemetry cycle, and never re-taken.
  *
- * Bringing the Zigbee stack up is the one stretch of a boot where nothing at
- * all holds a lock: the report window does not open until the first telemetry
- * cycle, the Modbus lock is per transaction, and app_main returns as soon as
- * zigbee_task is created, so the idle task is free to sleep the chip while
+ * Stack bring-up is otherwise the one stretch of a boot with no lock held
+ * anywhere: the report window does not open until the first cycle, the Modbus
+ * lock is per transaction, and app_main returns as soon as zigbee_task is
+ * created, leaving the idle task free to sleep the chip while
  * esp_zigbee_init() and esp_zigbee_start() are still bringing up the radio.
- * A battery run stopped there - stage 1 reached at 0s, stage 2 never recorded -
- * while the identical code path on USB, where light sleep is off, walks through
- * it in under three seconds every time.
  *
- * There is deliberately no failsafe timeout. A node that has not completed a
- * cycle has not shown it can survive a sleep, and releasing the lock on it is
- * how it disappears; holding it costs current on a node that is already broken,
- * and keeps it awake enough for the stall watchdog to restart it. */
+ * No failsafe timeout, deliberately. A node that has not completed a cycle has
+ * not shown it survives a sleep, and releasing the lock is how it disappears;
+ * holding it keeps the node awake enough for the stall watchdog to reach it. */
 static esp_pm_lock_handle_t s_startup_lock;
 
 static void release_startup_lock(void)
@@ -1413,21 +1365,16 @@ static void arm_stall_watchdog(void)
 
 static void telemetry_task(void *arg)
 {
-    /* Stamped from the task rather than from on_network_joined(), which runs in
-     * the stack task with the stack lock held - an NVS commit does not belong
-     * there. Reaching this line means the join signal arrived and the task was
-     * scheduled, which is what the stage is there to record. */
+    /* Stamped here rather than in on_network_joined(), which holds the stack
+     * lock - no place for an NVS commit. */
     record_stage(EPSOLAR_STAGE_JOINED);
 
-    /* Armed before Modbus initialisation rather than after it. The retry loop
-     * below never gives up, and on external power it logs to a console nobody
-     * is reading, so an initialisation that cannot succeed used to leave the
-     * node joined, announced, online in zigbee2mqtt and silent for as long as
-     * the supply lasted, with nothing watching it at all. Covering the loop
-     * turns that into a restart every EPSOLAR_STALL_RESTART_CYCLES intervals
-     * and a stall_restarts count that says so out loud. Initialisation is a
-     * local UART and driver setup that does not talk to the controller, so it
-     * has no legitimate reason to take three minutes. */
+    /* Armed before Modbus initialisation, because the retry loop below never
+     * gives up and logs to a console nobody reads on external power. Uncovered,
+     * an initialisation that cannot succeed leaves the node joined, announced
+     * and silent indefinitely. Initialisation is local UART and driver setup
+     * that never talks to the controller, so it has no legitimate reason to
+     * outlast the watchdog. */
     const esp_timer_create_args_t stall_timer = {
         .callback = telemetry_stalled,
         .name = "epsolar_stall",
@@ -1455,12 +1402,9 @@ static void telemetry_task(void *arg)
     TickType_t last_wake = xTaskGetTickCount();
     while (true) {
         epsolar_telemetry_t telemetry;
-        /* Sampled on wake, before this cycle transmits anything. That ordering
-         * is the whole point: after send_link_probe() the stack is legitimately
-         * fast polling for its ack and a 1 would mean nothing. Here a 1 means
-         * the node spent the entire idle gap in fast poll, which is the defect,
-         * and a 0 means it dropped back to the long poll interval as it
-         * should. */
+        /* Sampled before the cycle transmits: after send_link_probe() the stack
+         * is legitimately fast polling for its ack, so only a reading taken
+         * here says whether the node fast polled through the whole idle gap. */
         esp_zigbee_lock_acquire(portMAX_DELAY);
         bool fast_polling_on_wake = nwk_pim_is_fast_poll_running() != 0;
         esp_zigbee_lock_release();
@@ -1529,8 +1473,8 @@ static void telemetry_task(void *arg)
             save_diagnostics();
         }
         arm_stall_watchdog();
-        /* Idempotent, so this is simply "a cycle finished" rather than a first
-         * iteration special case. Until one has, the chip stays awake. */
+        /* Idempotent, so this reads as "a cycle finished" rather than needing a
+         * first-iteration special case. */
         release_startup_lock();
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS * 1000U));
     }
@@ -1592,6 +1536,26 @@ static void schedule_commissioning_retry(uint8_t mode)
     }
 }
 
+/* BDB commissioning statuses this node can plausibly see. */
+static const char *bdb_status_name(ezb_bdb_comm_status_t status)
+{
+    switch (status) {
+    case EZB_BDB_STATUS_SUCCESS: return "success";
+    case EZB_BDB_STATUS_IN_PROGRESS: return "in progress";
+    case EZB_BDB_STATUS_NO_NETWORK: return "no network";
+    case EZB_BDB_STATUS_TARGET_FAILURE: return "target failure";
+    case EZB_BDB_STATUS_FORMATION_FAILURE: return "formation failure";
+    case EZB_BDB_STATUS_NO_SCAN_RESPONSE: return "no scan response";
+    case EZB_BDB_STATUS_NOT_PERMITTED: return "not permitted";
+    case EZB_BDB_STATUS_TCLK_EX_FAILURE: return "trust centre key exchange failed";
+    case EZB_BDB_STATUS_NOT_ON_A_NETWORK: return "not on a network";
+    case EZB_BDB_STATUS_ON_A_NETWORK: return "already on a network";
+    case EZB_BDB_STATUS_CANCELLED: return "cancelled";
+    case EZB_BDB_STATUS_DEV_ANNCE_SEND_FAILURE: return "device announce not acked";
+    default: return "unknown";
+    }
+}
+
 static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
 {
     ezb_app_signal_type_t type = ezb_app_signal_get_type(signal);
@@ -1605,8 +1569,19 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
     case EZB_BDB_SIGNAL_DEVICE_REBOOT: {
         ezb_bdb_comm_status_t status = *(ezb_bdb_comm_status_t *)ezb_app_signal_get_params(signal);
         if (status != EZB_BDB_STATUS_SUCCESS) {
-            ESP_LOGW(TAG, "Zigbee initialization failed: 0x%02x", status);
-            schedule_commissioning_retry(EZB_BDB_MODE_INITIALIZATION);
+            /* Escalate to steering rather than retrying initialisation.
+             * Initialisation reads stored network state; if that state does not
+             * get the node back onto its network, reading it again will not
+             * either, and retrying it is a livelock. Steering on a device that
+             * is not factory new is a rejoin, which is the recovery this needs,
+             * and a failed steering schedules its own retry below. */
+            ESP_LOGW(
+                TAG,
+                "Zigbee initialization failed: 0x%02x (%s); rejoining instead",
+                status,
+                bdb_status_name(status)
+            );
+            schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
             break;
         }
         if (ezb_bdb_is_factory_new()) {
@@ -1638,7 +1613,12 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             );
             on_network_joined();
         } else {
-            ESP_LOGW(TAG, "Zigbee network steering failed: 0x%02x", status);
+            ESP_LOGW(
+                TAG,
+                "Zigbee network steering failed: 0x%02x (%s)",
+                status,
+                bdb_status_name(status)
+            );
             schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
         }
         break;
@@ -1773,11 +1753,10 @@ void app_main(void)
     report_boot_diagnostics();
     configure_power_management();
     register_light_sleep_counters();
-    /* First stamp of the boot, and deliberately after the power management
-     * decision rather than before it: light_sleep_enabled is set by
-     * configure_power_management(), so a stamp taken any earlier records
-     * light_sleep=0 for every run whatever the regime, which is precisely the
-     * field a readout uses to tell a USB run from a battery one. */
+    /* After configure_power_management(), not before: it sets
+     * light_sleep_enabled, and an earlier stamp would record light_sleep=0 for
+     * every run regardless of regime - the one field a readout uses to tell a
+     * USB run from a battery one. */
     record_stage(EPSOLAR_STAGE_POWER_CONFIGURED);
     ESP_ERROR_CHECK(
         xTaskCreate(zigbee_task, "zigbee_main", 6144, NULL, 5, NULL) == pdPASS
