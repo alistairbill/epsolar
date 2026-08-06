@@ -43,6 +43,20 @@
  * inside this; the timeout only covers a confirm that never comes. */
 #define EPSOLAR_REPORT_WINDOW_TIMEOUT_MS 15000
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
+/* The stack defaults this to 200 ms, and the node was observed sitting in fast
+ * poll indefinitely rather than falling back to the keepalive above: two wakes
+ * per 200 ms, ten a second, for the entire gap between telemetry cycles.
+ *
+ * Raising it is close to free. Fast poll exists to collect the APS ack for
+ * something just sent, and everything this node sends is sent inside the report
+ * window - during which EPSOLAR_REPORT_WINDOW_TIMEOUT_MS of no-light-sleep lock
+ * is held and the chip is awake regardless of how often it polls. The interval
+ * therefore only governs how hard the radio is worked while idle, which is
+ * precisely the behaviour that needs to stop. The ceiling is the parent's
+ * macTransactionPersistenceTime, 7.68 s, after which it discards an indirect
+ * transaction unfetched; 2 s leaves most of that as margin and still allows
+ * seven polls inside a report window. */
+#define EPSOLAR_ZIGBEE_FAST_POLL_MS 2000
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 /* Hold out for a parent with some link margin, not one at the edge of hearing. */
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 40
@@ -1651,15 +1665,17 @@ static void zigbee_task(void *arg)
      * field reaches the stack at all is the cheaper of the two explanations to
      * eliminate, so assert the interval explicitly and log what the stack
      * actually holds. */
-    uint32_t keepalive_from_config = ezb_nwk_get_keepalive_interval();
+    uint32_t keepalive_before = ezb_nwk_get_keepalive_interval();
+    uint32_t fast_poll_before = ezb_nwk_get_fast_poll_interval();
     ezb_nwk_set_keepalive_interval(EPSOLAR_ZIGBEE_KEEP_ALIVE_MS);
+    ezb_nwk_set_fast_poll_interval(EPSOLAR_ZIGBEE_FAST_POLL_MS);
     ESP_LOGW(
         TAG,
-        "SED poll configuration: keepalive %" PRIu32 "ms from zed_config, %" PRIu32
-        "ms after setting it explicitly (asked for %ums); fast_poll=%" PRIu32 "ms",
-        keepalive_from_config,
+        "SED poll configuration: keepalive %" PRIu32 "ms -> %" PRIu32
+        "ms, fast poll %" PRIu32 "ms -> %" PRIu32 "ms",
+        keepalive_before,
         ezb_nwk_get_keepalive_interval(),
-        (unsigned)EPSOLAR_ZIGBEE_KEEP_ALIVE_MS,
+        fast_poll_before,
         ezb_nwk_get_fast_poll_interval()
     );
     ezb_aps_secur_enable_distributed_security(false);
