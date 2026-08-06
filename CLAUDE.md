@@ -136,15 +136,23 @@ Light sleep is the fragile part; read `DEBUGGING.md` before changing anything he
 The node cannot be observed while failing (attaching USB requires pulling external power,
 which is a power-on reset — the one event RTC RAM does not survive). So `s_diag`
 (`RTC_NOINIT_ATTR`, mirrored to the `epsolar` NVS namespace) is the channel:
-`save_diagnostics()` writes at boot, then every cycle for the first 30 cycles and every
-10th after that, and **refuses to write while a USB host is attached** so the failed run's
-snapshot survives the readout boot and any number of monitor resets.
+There are **two NVS records under separate keys**, and they must stay separate. The run
+record (`diag`) is written only from the cycle loop, so it always describes a run that
+produced telemetry; the boot record (`boot`) is stamped by `record_stage()` as each boot
+passes a milestone. They shared a key once, and a boot that died early overwrote the last
+good run with a `cycles=0` stub — destroying the exact snapshot the black box existed to
+capture. Every write goes through `save_diagnostics_to()`, which **refuses while a USB host
+is attached**; that freeze is the only thing protecting the evidence.
 
-`report_boot_diagnostics()` prints **both** sources, deliberately: a USB reset (reason 11
-— what `idf.py monitor` performs) preserves RTC RAM, so the RTC RAM line describes the
-readout session, while the frozen NVS line is the field run. Reporting only whichever
-source happened to be valid hid the latter behind the former. Counters continue from RTC
-RAM when it survived, since NVS lags it by up to `EPSOLAR_DIAG_SAVE_CYCLES`.
+`record_stage()` runs after `configure_power_management()`, never before — `light_sleep_enabled`
+is set there, and a stamp taken earlier records `light_sleep=0` for every run regardless of
+regime, which is the field a readout uses to tell a USB run from a battery one.
+
+`report_boot_diagnostics()` prints **all three** sources under one boot header: a USB reset
+(reason 11 — what `idf.py monitor` performs) preserves RTC RAM, so the RTC RAM record
+describes the readout session, not the field run. Reporting only whichever source happened
+to be valid hid the field run behind the readout stub. Each record names the run it
+describes, because they are routinely different runs.
 
 **`epsolar_diag_t`'s layout and `EPSOLAR_DIAG_MAGIC` are a wire format.** `load_diagnostics()`
 rejects on both a magic mismatch and a size mismatch, so changing either discards the

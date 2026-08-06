@@ -24,9 +24,11 @@ idf.py -p /dev/cu.usbmodem* build flash monitor
 ```
 
 `idf.py flash` does not touch the NVS partition, so anything already stored
-there survives. The diagnostics blob is versioned, though, and this build bumped
-the version, so **the first boot after this flash will say `no retained
-diagnostics`**. That is correct, not a failure.
+there survives. The diagnostics blob is versioned, though, and a build that
+bumps `EPSOLAR_DIAG_MAGIC` or changes `epsolar_diag_t` discards every stored
+record, so **the first boot after such a flash will say `no retained
+diagnostics`**. That is correct, not a failure — but it also means never
+changing either while a snapshot is still waiting to be read.
 
 Stay in the monitor for two or three minutes and check the node joins and starts
 reporting:
@@ -81,44 +83,57 @@ like.**
 Do not press RESET hoping for more: an EN reset is a power-on reset as far as
 RTC RAM is concerned, and there is nothing extra there anyway.
 
-You get **two** lines, and you want the second one:
+You get a boot header and up to **three** records, each naming the run it
+describes:
 
 ```
-… previous run (RTC RAM): …
-… previous run (NVS, as of its last cycle): …
+W epsolar_zigbee: Boot 12 (reset reason 11); retained diagnostics:
+W epsolar_zigbee:   run 11 (RTC RAM, history 0x0b01010b): stage=4 (Modbus ready) at 4s cycles=1 …
+W epsolar_zigbee:   run 10 (NVS boot record, history 0x010b0101): stage=3 (joined) at 3s cycles=0 …
+W epsolar_zigbee:   run 10 (NVS run record, as of its last cycle, history 0x010b0101): stage=4 …
 ```
 
-They are different runs, and the difference is the whole point. Attaching the
+They are routinely *different runs*, and that is the whole point. Attaching the
 cable is a power-on reset, so RTC RAM holds only the handful of seconds the
 board has been up since — and the monitor's own reset is a *USB* reset, reset
-reason 11, which preserves RTC RAM rather than clearing it. So the RTC RAM line
-describes your readout, not the failure. Tell them apart by `light_sleep`: a
-readout run reports `light_sleep=0`, because USB was attached when it booted.
+reason 11, which preserves RTC RAM rather than clearing it. So the RTC RAM
+record describes your readout, not the failure.
 
-The NVS line is the field run. It is the one frozen the moment you plugged in.
+- **RTC RAM** — the most recent run, and the only record of a run the node ended
+  itself with `esp_restart()`. During a readout this is the readout.
+- **NVS boot record** — how far the last non-USB boot got, stamped at each
+  milestone. This is the one that survives a run which never produced telemetry.
+- **NVS run record** — the last run that completed at least one cycle. It is
+  never overwritten by a boot that died early, so it can be much older than the
+  other two. Check its `run` number before drawing conclusions from it.
 
-The line you want:
-
-```
-W epsolar_zigbee: Boot 7 (reset reason 1, history 0x00030301); previous run
-(NVS, as of its last cycle): cycles=182 modbus_failures=0 publish_failures=0
-report_confirms=3 report_failures=179 last_probe_status=0xa7 announces=4
-rejoins=2 stall_restarts=0 last_cycle=10921s last_publish=0s last_confirm=10740s
-light_sleep=1 light_sleeps=8934 slept=10402s longest_sleep=59713ms
-wakeup_causes=0x00000010
-```
+Tell a readout apart from a field run by `light_sleep`: a readout run reports
+`light_sleep=0`, because USB was attached when it booted.
 
 ## 5. Decode
 
-Read three fields first: `cycles`, `light_sleeps`, `report_confirms`.
+If `cycles=0`, read `stage` first — the run never produced a counter worth
+reading, and `stage` is the only thing that says where it stopped:
+
+| `stage` | Reached | So it died in |
+|---|---|---|
+| 1 | power configured | the Zigbee stack init, or `register_device()` |
+| 2 | Zigbee started | commissioning — it never joined |
+| 3 | joined | `epsolar_modbus_init()`, which retries forever on failure |
+| 4 | Modbus ready | the first Modbus read or publish |
+
+`stage=4` with `cycles=0` is the one that means the wiring is fine and the first
+transaction is what hangs. `stage=3` that never advances means Modbus init is
+failing in a loop — on external power, with no console to say so.
+
+Otherwise read `cycles`, `light_sleeps`, `report_confirms`:
 
 | What you see | What happened |
 |---|---|
 | `cycles` large, `light_sleeps` large, `report_confirms` frozen low | App alive and sleeping fine, **radio path died**. Downlink/ack problem. |
 | `cycles` ≈ 3, `last_cycle` ≈ 180s, `light_sleeps` small but non-zero | **Chip stopped waking.** Wedged in or after a light sleep. |
 | `light_sleeps=0` | Light sleep never engaged. The fault is something else entirely. |
-| `cycles=0` with `boots` moved on | Booted and died before joining. Never reached a telemetry cycle. |
-| `stall_restarts` > 0 and `boots` climbing | App was hanging; the watchdog kept recovering it. |
+| `stall_restarts` > 0 and the `run` number climbing | App was hanging; the watchdog kept recovering it. |
 | `slept` ≈ `last_cycle` | Sleeping essentially all the time. Normal and healthy. |
 
 Supporting fields:

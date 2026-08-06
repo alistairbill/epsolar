@@ -88,15 +88,46 @@ static bool telemetry_task_started;
  * one - and carries the counters only across the software restarts the node
  * performs itself, where .bss would have been zeroed.
  *
- * Nothing is written to NVS at boot, and save_diagnostics() refuses to write
- * at all while a USB host is present, so the snapshot of the failed run
- * survives the boot that attaching the cable causes and every reset the
- * monitor does after it. Readout is idempotent: reset as often as you like. */
-#define EPSOLAR_DIAG_MAGIC 0x45505335U /* "EPS5" */
+ * Every write refuses while a USB host is present, so the snapshot of the
+ * failed run survives the boot that attaching the cable causes and every reset
+ * the monitor does after it. Readout is idempotent: reset as often as you
+ * like. That freeze is the only thing protecting the evidence, so anything
+ * added to the save path has to go through save_diagnostics_to(). */
+#define EPSOLAR_DIAG_MAGIC 0x45505336U /* "EPS6" */
 #define EPSOLAR_DIAG_NAMESPACE "epsolar"
-#define EPSOLAR_DIAG_KEY "diag"
+/* Two records, because one of them kept destroying the other. The run record is
+ * written only from the cycle loop, so it always describes a run that got as far
+ * as producing telemetry; the boot record is stamped as the current boot passes
+ * each milestone. Sharing a key meant a boot that died early overwrote the last
+ * good run with a cycles=0 stub - which is exactly what happened to the first
+ * external-power snapshot this black box was built to catch. */
+#define EPSOLAR_DIAG_RUN_KEY "diag"
+#define EPSOLAR_DIAG_BOOT_KEY "boot"
 #define EPSOLAR_DIAG_DENSE_CYCLES 30
 #define EPSOLAR_DIAG_SAVE_CYCLES 10
+
+/* How far the current boot got. The interesting failures are all in the stretch
+ * between reset and the first completed cycle, which produces no counters at
+ * all and, on external power, no console output either. */
+enum {
+    EPSOLAR_STAGE_RESET = 0,
+    EPSOLAR_STAGE_POWER_CONFIGURED,
+    EPSOLAR_STAGE_ZIGBEE_STARTED,
+    EPSOLAR_STAGE_JOINED,
+    EPSOLAR_STAGE_MODBUS_READY,
+};
+
+static const char *stage_name(uint8_t stage)
+{
+    switch (stage) {
+    case EPSOLAR_STAGE_RESET: return "reset";
+    case EPSOLAR_STAGE_POWER_CONFIGURED: return "power configured";
+    case EPSOLAR_STAGE_ZIGBEE_STARTED: return "Zigbee started";
+    case EPSOLAR_STAGE_JOINED: return "joined";
+    case EPSOLAR_STAGE_MODBUS_READY: return "Modbus ready";
+    default: return "unknown";
+    }
+}
 
 /* Counters are bumped from both the telemetry task and the Zigbee stack task.
  * The increments are not atomic; a lost count in a diagnostic is cheaper than
@@ -125,7 +156,9 @@ typedef struct {
     uint32_t last_publish_uptime_s;
     uint32_t last_confirm_uptime_s;
     uint32_t last_cycle_uptime_s;
+    uint32_t stage_uptime_s;
     uint8_t last_probe_status;
+    uint8_t stage;
     bool light_sleep_enabled;
 } epsolar_diag_t;
 
@@ -136,7 +169,7 @@ static uint32_t uptime_seconds(void)
     return (uint32_t)(esp_timer_get_time() / 1000000);
 }
 
-static void save_diagnostics(void)
+static void save_diagnostics_to(const char *key)
 {
     /* A USB host means somebody is reading, not that the node is running: the
      * supply has to be pulled before the cable goes in, so every readout
@@ -158,7 +191,7 @@ static void save_diagnostics(void)
         ESP_LOGW(TAG, "Unable to open diagnostics storage: %s", esp_err_to_name(err));
         return;
     }
-    err = nvs_set_blob(nvs, EPSOLAR_DIAG_KEY, &s_diag, sizeof(s_diag));
+    err = nvs_set_blob(nvs, key, &s_diag, sizeof(s_diag));
     if (err == ESP_OK) {
         err = nvs_commit(nvs);
     }
@@ -168,36 +201,52 @@ static void save_diagnostics(void)
     nvs_close(nvs);
 }
 
-static bool load_diagnostics(epsolar_diag_t *diag)
+static void save_diagnostics(void)
+{
+    save_diagnostics_to(EPSOLAR_DIAG_RUN_KEY);
+}
+
+/* Records how far this boot has got, in its own key, so it cannot overwrite the
+ * last run that produced telemetry. */
+static void record_stage(uint8_t stage)
+{
+    s_diag.stage = stage;
+    s_diag.stage_uptime_s = uptime_seconds();
+    save_diagnostics_to(EPSOLAR_DIAG_BOOT_KEY);
+}
+
+static bool load_diagnostics(const char *key, epsolar_diag_t *diag)
 {
     nvs_handle_t nvs;
     if (nvs_open(EPSOLAR_DIAG_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
         return false;
     }
     size_t length = sizeof(*diag);
-    bool loaded = nvs_get_blob(nvs, EPSOLAR_DIAG_KEY, diag, &length) == ESP_OK
+    bool loaded = nvs_get_blob(nvs, key, diag, &length) == ESP_OK
         && length == sizeof(*diag)
         && diag->magic == EPSOLAR_DIAG_MAGIC;
     nvs_close(nvs);
     return loaded;
 }
 
-static void log_previous_run(const char *source, esp_reset_reason_t reason, const epsolar_diag_t *previous)
+static void log_previous_run(const char *source, const epsolar_diag_t *previous)
 {
     ESP_LOGW(
         TAG,
-        "Boot %" PRIu32 " (reset reason %d, history 0x%08" PRIx32
-        "); previous run (%s): cycles=%" PRIu32
+        "  run %" PRIu32 " (%s, history 0x%08" PRIx32
+        "): stage=%u (%s) at %" PRIu32 "s cycles=%" PRIu32
         " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
         " report_confirms=%" PRIu32 " report_failures=%" PRIu32
         " last_probe_status=0x%02x announces=%" PRIu32 " rejoins=%" PRIu32
         " stall_restarts=%" PRIu32 " last_cycle=%" PRIu32 "s last_publish=%" PRIu32
         "s last_confirm=%" PRIu32 "s light_sleep=%d light_sleeps=%" PRIu32
         " slept=%" PRIu32 "s longest_sleep=%" PRIu32 "ms wakeup_causes=0x%08" PRIx32,
-        previous->boots + 1,
-        reason,
-        previous->reset_reasons,
+        previous->boots,
         source,
+        previous->reset_reasons,
+        previous->stage,
+        stage_name(previous->stage),
+        previous->stage_uptime_s,
         previous->cycles,
         previous->modbus_failures,
         previous->publish_failures,
@@ -237,27 +286,41 @@ static void report_boot_diagnostics(void)
 {
     esp_reset_reason_t reason = esp_reset_reason();
     epsolar_diag_t retained = s_diag;
-    epsolar_diag_t stored;
+    epsolar_diag_t last_run;
+    epsolar_diag_t last_boot;
     bool have_retained = retained.magic == EPSOLAR_DIAG_MAGIC;
-    bool have_stored = load_diagnostics(&stored);
+    bool have_run = load_diagnostics(EPSOLAR_DIAG_RUN_KEY, &last_run);
+    bool have_boot = load_diagnostics(EPSOLAR_DIAG_BOOT_KEY, &last_boot);
 
-    if (have_retained) {
-        log_previous_run("RTC RAM", reason, &retained);
-    }
-    if (have_stored) {
-        log_previous_run("NVS, as of its last cycle", reason, &stored);
-    }
-    if (!have_retained && !have_stored) {
-        ESP_LOGI(TAG, "Boot 1 (reset reason %d); no retained diagnostics", reason);
-    }
-
-    /* Counters continue from the fresher source. RTC RAM outranks NVS when it
-     * survived, because NVS lags it by up to EPSOLAR_DIAG_SAVE_CYCLES. */
+    /* Counters continue from the freshest source. RTC RAM outranks both stored
+     * records when it survived, since NVS lags it by up to
+     * EPSOLAR_DIAG_SAVE_CYCLES, and the boot record outranks the run record
+     * because a boot that never cycled never touches the latter. */
     epsolar_diag_t previous = (epsolar_diag_t){0};
     if (have_retained) {
         previous = retained;
-    } else if (have_stored) {
-        previous = stored;
+    } else if (have_boot && (!have_run || last_boot.boots >= last_run.boots)) {
+        previous = last_boot;
+    } else if (have_run) {
+        previous = last_run;
+    }
+
+    if (!have_retained && !have_run && !have_boot) {
+        ESP_LOGI(TAG, "Boot 1 (reset reason %d); no retained diagnostics", reason);
+    } else {
+        /* One boot number, stated once. Each record then names the run it
+         * describes, because they are routinely different runs and printing a
+         * "Boot N" per record invited reading a readout stub as the field run. */
+        ESP_LOGW(TAG, "Boot %" PRIu32 " (reset reason %d); retained diagnostics:", previous.boots + 1, reason);
+        if (have_retained) {
+            log_previous_run("RTC RAM", &retained);
+        }
+        if (have_boot) {
+            log_previous_run("NVS boot record", &last_boot);
+        }
+        if (have_run) {
+            log_previous_run("NVS run record, as of its last cycle", &last_run);
+        }
     }
 
     s_diag = (epsolar_diag_t){
@@ -266,16 +329,6 @@ static void report_boot_diagnostics(void)
         .stall_restarts = previous.stall_restarts,
         .reset_reasons = (previous.reset_reasons << 8) | (uint8_t)reason,
     };
-
-    /* A run that dies before its first telemetry cycle otherwise leaves nothing
-     * at all: save_diagnostics() is only reached from the cycle loop and the
-     * repair ladder, and the cycle loop only starts once the node has joined.
-     * Stamping the boot here makes "booted, never joined" - cycles=0 with a
-     * boots that moved - distinguishable from "never booted", and keeps the
-     * reset-reason history unbroken across a run that never cycles. Refuses to
-     * write while USB is attached, like every other save, so the snapshot being
-     * read out survives this. */
-    save_diagnostics();
 }
 
 /* Decide once at boot: a USB host present means the no-sleep reference run,
@@ -1264,6 +1317,12 @@ static void arm_stall_watchdog(void)
 
 static void telemetry_task(void *arg)
 {
+    /* Stamped from the task rather than from on_network_joined(), which runs in
+     * the stack task with the stack lock held - an NVS commit does not belong
+     * there. Reaching this line means the join signal arrived and the task was
+     * scheduled, which is what the stage is there to record. */
+    record_stage(EPSOLAR_STAGE_JOINED);
+
     epsolar_modbus_t modbus = {0};
     esp_err_t err;
     while ((err = epsolar_modbus_init(&modbus)) != ESP_OK) {
@@ -1275,6 +1334,8 @@ static void telemetry_task(void *arg)
         );
         vTaskDelay(pdMS_TO_TICKS(EPSOLAR_MODBUS_INIT_RETRY_MS));
     }
+
+    record_stage(EPSOLAR_STAGE_MODBUS_READY);
 
     const esp_timer_create_args_t stall_timer = {
         .callback = telemetry_stalled,
@@ -1525,6 +1586,7 @@ static void zigbee_task(void *arg)
     ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
     register_device();
     ESP_ERROR_CHECK(esp_zigbee_start(false));
+    record_stage(EPSOLAR_STAGE_ZIGBEE_STARTED);
     esp_zigbee_launch_mainloop();
 
     ESP_LOGE(TAG, "Zigbee main loop exited");
@@ -1557,6 +1619,12 @@ void app_main(void)
     report_boot_diagnostics();
     configure_power_management();
     register_light_sleep_counters();
+    /* First stamp of the boot, and deliberately after the power management
+     * decision rather than before it: light_sleep_enabled is set by
+     * configure_power_management(), so a stamp taken any earlier records
+     * light_sleep=0 for every run whatever the regime, which is precisely the
+     * field a readout uses to tell a USB run from a battery one. */
+    record_stage(EPSOLAR_STAGE_POWER_CONFIGURED);
     ESP_ERROR_CHECK(
         xTaskCreate(zigbee_task, "zigbee_main", 6144, NULL, 5, NULL) == pdPASS
             ? ESP_OK
