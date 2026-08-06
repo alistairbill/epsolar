@@ -74,6 +74,7 @@
  *   because the link is suspect exactly then. */
 #define EPSOLAR_ZIGBEE_IDLE_POLL_MS CONFIG_EPSOLAR_ZIGBEE_IDLE_POLL_MS
 #define EPSOLAR_ZIGBEE_ACTIVE_POLL_MS 200
+#define EPSOLAR_REPORT_PACING_MS CONFIG_EPSOLAR_REPORT_PACING_MS
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 /* Hold out for a parent with some link margin, not one at the edge of hearing. */
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 40
@@ -590,7 +591,9 @@ static bool set_battery_power_descriptor(uint8_t source_level)
         .current_power_source = EZB_AF_NODE_POWER_SOURCE_RECHARGEABLE_BATTERY,
         .current_power_source_level = source_level,
     };
+    esp_zigbee_lock_acquire(portMAX_DELAY);
     ezb_err_t err = ezb_af_set_node_power_desc(&descriptor);
+    esp_zigbee_lock_release();
     if (err == EZB_ERR_NONE) {
         return true;
     }
@@ -887,10 +890,21 @@ static const struct {
 #define EPSOLAR_REPORTED_ATTRIBUTE_COUNT \
     (sizeof(reported_attributes) / sizeof(reported_attributes[0]))
 
-/* Caller holds the Zigbee stack lock. Returns true once every attribute is
- * armed, so the caller can keep retrying: the coordinator's Configure
- * Reporting is what creates the reporting records, and on a fresh join it can
- * land after our first telemetry cycle.
+/* Let the mainloop transmit the report the last write or arm fired before the
+ * next one is queued. Unpaced, the cycle's ~16 frames leave the radio back to
+ * back - the sharpest load the node puts on its supply. */
+static void pace_report_burst(void)
+{
+#if EPSOLAR_REPORT_PACING_MS > 0
+    vTaskDelay(pdMS_TO_TICKS(EPSOLAR_REPORT_PACING_MS));
+#endif
+}
+
+/* Takes and drops the stack lock per attribute - arming an attribute fires a
+ * report, so each arm is paced like a write. Returns true once every
+ * attribute is armed, so the caller can keep retrying: the coordinator's
+ * Configure Reporting is what creates the reporting records, and on a fresh
+ * join it can land after our first telemetry cycle.
  *
  * zigbee2mqtt asks for min 10 s / max 300 s, but that configuration only
  * produces on-change reports here: the max-interval heartbeat never fires, so
@@ -903,6 +917,7 @@ static bool configure_local_reporting(void)
     uint32_t present = 0;
     uint32_t armed = 0;
     for (size_t i = 0; i < EPSOLAR_REPORTED_ATTRIBUTE_COUNT; ++i) {
+        esp_zigbee_lock_acquire(portMAX_DELAY);
         ezb_zcl_reporting_info_t info = ezb_zcl_reporting_info_find(
             reported_attributes[i].endpoint,
             reported_attributes[i].cluster,
@@ -911,6 +926,7 @@ static bool configure_local_reporting(void)
             EZB_ZCL_STD_MANUF_CODE
         );
         if (info == EZB_ZCL_INVALID_REPORTING_INFO) {
+            esp_zigbee_lock_release();
             continue;
         }
         present |= 1U << i;
@@ -923,6 +939,7 @@ static bool configure_local_reporting(void)
             &delta
         );
         if (err != EZB_ERR_NONE) {
+            esp_zigbee_lock_release();
             ESP_LOGW(
                 TAG,
                 "Unable to arm reporting for endpoint=%u cluster=0x%04x attribute=0x%04x: 0x%04x",
@@ -934,6 +951,8 @@ static bool configure_local_reporting(void)
             continue;
         }
         ezb_zcl_reporting_start_attr_report(info);
+        esp_zigbee_lock_release();
+        pace_report_burst();
         armed |= 1U << i;
     }
 
@@ -955,8 +974,12 @@ static bool configure_local_reporting(void)
     return __builtin_popcount(armed) == (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT;
 }
 
+/* Takes and drops the stack lock itself, per write, and paces afterwards: the
+ * mainloop can only transmit the report a write fires while the lock is free.
+ * Only the telemetry task calls this. */
 static bool set_attribute(uint8_t endpoint, uint16_t cluster, uint16_t attribute, void *value)
 {
+    esp_zigbee_lock_acquire(portMAX_DELAY);
     ezb_zcl_status_t status = ezb_zcl_set_attr_value(
         endpoint,
         cluster,
@@ -966,6 +989,8 @@ static bool set_attribute(uint8_t endpoint, uint16_t cluster, uint16_t attribute
         value,
         false
     );
+    esp_zigbee_lock_release();
+    pace_report_burst();
     if (status == EZB_ZCL_STATUS_SUCCESS) {
         return true;
     }
@@ -1022,10 +1047,11 @@ static bool publish_dc_measurements(
     return success;
 }
 
+/* Runs unlocked: every stack call below takes and drops the lock itself, so
+ * the mainloop transmits each report in the pacing gap after the write that
+ * fired it rather than all at once when a publish-wide hold would end. */
 static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
 {
-    esp_zigbee_lock_acquire(portMAX_DELAY);
-
     bool success = true;
     if (telemetry->valid & EPSOLAR_VALID_ARRAY) {
         success &= publish_dc_measurements(
@@ -1116,7 +1142,6 @@ static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
         reporting_configured = configure_local_reporting();
     }
 
-    esp_zigbee_lock_release();
     return success;
 }
 
@@ -1207,9 +1232,9 @@ static void link_probe_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
  * get: ezb_zcl_set_attr_value() succeeds against a dead radio path, and
  * ezb_bdb_dev_joined() keeps returning true with a dead parent.
  *
- * Exactly one frame per cycle, and the caller must not hold the stack lock:
- * bursting reports drains the fixed out-buffer pool and starves the mainloop
- * that would otherwise drain it. */
+ * Exactly one frame per cycle, taking and dropping the lock itself like the
+ * rest of the publish path. No pacing after it: it is the cycle's last frame,
+ * and the confirm is what ends the report window. */
 static void send_link_probe(void)
 {
     ezb_zcl_report_attr_cmd_t command = {

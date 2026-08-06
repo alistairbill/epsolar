@@ -58,10 +58,13 @@ Data path: `modbus.c` (block descriptors, esp-modbus master) → `solar.c` (regi
 into `epsolar_telemetry_t`, per-block `valid` bitmask) → `main.c` (`publish_telemetry`
 maps fields onto ZCL attributes).
 
-Any call touching the stack must hold `esp_zigbee_lock_acquire()`/`_release()`, **except**
-`send_link_probe`, which deliberately takes and drops the lock around a single command —
-bursting reports under the lock drains the fixed out-buffer pool and starves the mainloop
-that would drain it.
+Any call touching the stack must hold `esp_zigbee_lock_acquire()`/`_release()`. The
+publish path (`set_attribute`, `configure_local_reporting`, `set_battery_power_descriptor`)
+and `send_link_probe` deliberately take and drop the lock **per command**, with an
+`EPSOLAR_REPORT_PACING_MS` pause after each write/arm — bursting reports under one hold
+drains the fixed out-buffer pool and starves the mainloop that would drain it, and the
+back-to-back radio burst released at the end of the hold is the sharpest supply load the
+node generates.
 
 ## Endpoint map — keep in sync with `epsolar.mjs`
 

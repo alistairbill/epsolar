@@ -31,6 +31,24 @@ config EPSOLAR_ZIGBEE_IDLE_POLL_MS
         already miss the 491 ms deadline; the repair ladder recovers those by
         steering at 200 ms, but only after minutes of silence.
 
+config EPSOLAR_REPORT_PACING_MS
+    int "Gap between report transmissions (milliseconds)"
+    range 0 1000
+    default 50
+    help
+        Pause after each attribute write and each reporting-record arm during
+        a telemetry cycle, with the Zigbee stack lock released so the
+        mainloop transmits the report the write fired before the next one is
+        queued. Zero paces nothing: the cycle's ~16 frames leave the radio
+        back to back.
+
+        The back-to-back burst is the sharpest load the node puts on its
+        supply and is fatal on a supply that sags under it; paced single
+        frames give the rail recovery time between transmissions, at the
+        cost of under a second of extra awake time per cycle. Pacing also
+        stops the publish path from draining the stack's fixed out-buffer
+        pool faster than the mainloop refills it.
+
 config EPSOLAR_LIGHT_SLEEP
     bool "Enable automatic light sleep"
     depends on PM_ENABLE && FREERTOS_USE_TICKLESS_IDLE
