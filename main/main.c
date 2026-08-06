@@ -60,7 +60,7 @@
  * fast polling. esp_zb_set_default_long_poll_interval() is a macro over the
  * keepalive setter, so the two names are the same knob. It is very nearly
  * decorative here, because the node never leaves fast poll to use it. */
-#define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
+#define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS CONFIG_EPSOLAR_ZIGBEE_KEEP_ALIVE_MS
 /* Slow fast poll down rather than trying to escape it.
  *
  * The library defaults this to 200 ms and never falls back to the long poll
@@ -72,12 +72,11 @@
  * Escaping fast poll properly was tried and is not available: stopping it costs
  * the node the only receive window it has, every probe after the stop failed,
  * and the stack thrashed on retries instead of sleeping. So the interval is the
- * lever, and the constraint on it is the parent, not this node - an indirect
- * transaction is discarded after macTransactionPersistenceTime, 7.68 s, and the
- * APS layer will retry a frame whose ack it has not seen well before that. 1 s
- * keeps both of those comfortably in hand and still takes the wake rate down
- * fivefold. Raise it only against evidence that acks still arrive. */
-#define EPSOLAR_ZIGBEE_FAST_POLL_MS 1000
+ * lever, and it is a Kconfig option because the useful value has to be found by
+ * walking it up against probe_ok/probe_fail rather than argued from first
+ * principles. The ceiling in the range is the parent's
+ * macTransactionPersistenceTime of 7.68 s; see the help text. */
+#define EPSOLAR_ZIGBEE_FAST_POLL_MS CONFIG_EPSOLAR_ZIGBEE_FAST_POLL_MS
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 /* Hold out for a parent with some link margin, not one at the edge of hearing. */
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 40
@@ -1670,6 +1669,33 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
     return true;
 }
 
+/* The parent ages a child out after ed_timeout without a keepalive poll, so the
+ * timeout has to outlast the long poll interval or the node is simply dropped -
+ * which is the part the "set keep_alive to an hour" workaround leaves out.
+ * Derive it rather than leaving two coupled constants to drift apart: pick the
+ * shortest timeout covering two poll intervals, and never go below the 8
+ * minutes this node has always used, so the default configuration is unchanged. */
+static uint8_t end_device_timeout_for(uint32_t keep_alive_ms)
+{
+    static const struct {
+        uint8_t value;
+        uint32_t seconds;
+    } timeouts[] = {
+        {EZB_NWK_ED_TIMEOUT_8MIN, 480},
+        {EZB_NWK_ED_TIMEOUT_16MIN, 960},
+        {EZB_NWK_ED_TIMEOUT_32MIN, 1920},
+        {EZB_NWK_ED_TIMEOUT_64MIN, 3840},
+        {EZB_NWK_ED_TIMEOUT_128MIN, 7680},
+    };
+    uint32_t required_s = (keep_alive_ms / 1000U) * 2U;
+    for (size_t i = 0; i < sizeof(timeouts) / sizeof(timeouts[0]); ++i) {
+        if (timeouts[i].seconds >= required_s) {
+            return timeouts[i].value;
+        }
+    }
+    return EZB_NWK_ED_TIMEOUT_128MIN;
+}
+
 static void zigbee_task(void *arg)
 {
     esp_zigbee_config_t config = {
@@ -1682,7 +1708,7 @@ static void zigbee_task(void *arg)
                  * minutes cannot receive anything: the parent holds indirect
                  * transactions for 7.68 s. Poll on the telemetry cadence, so
                  * downlink works and a dead parent is noticed in minutes. */
-                .ed_timeout = EZB_NWK_ED_TIMEOUT_8MIN,
+                .ed_timeout = end_device_timeout_for(EPSOLAR_ZIGBEE_KEEP_ALIVE_MS),
                 .keep_alive = EPSOLAR_ZIGBEE_KEEP_ALIVE_MS,
             },
         },
