@@ -182,57 +182,82 @@ static bool load_diagnostics(epsolar_diag_t *diag)
     return loaded;
 }
 
+static void log_previous_run(const char *source, esp_reset_reason_t reason, const epsolar_diag_t *previous)
+{
+    ESP_LOGW(
+        TAG,
+        "Boot %" PRIu32 " (reset reason %d, history 0x%08" PRIx32
+        "); previous run (%s): cycles=%" PRIu32
+        " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
+        " report_confirms=%" PRIu32 " report_failures=%" PRIu32
+        " last_probe_status=0x%02x announces=%" PRIu32 " rejoins=%" PRIu32
+        " stall_restarts=%" PRIu32 " last_cycle=%" PRIu32 "s last_publish=%" PRIu32
+        "s last_confirm=%" PRIu32 "s light_sleep=%d light_sleeps=%" PRIu32
+        " slept=%" PRIu32 "s longest_sleep=%" PRIu32 "ms wakeup_causes=0x%08" PRIx32,
+        previous->boots + 1,
+        reason,
+        previous->reset_reasons,
+        source,
+        previous->cycles,
+        previous->modbus_failures,
+        previous->publish_failures,
+        previous->report_confirms,
+        previous->report_failures,
+        previous->last_probe_status,
+        previous->announces,
+        previous->rejoins,
+        previous->stall_restarts,
+        previous->last_cycle_uptime_s,
+        previous->last_publish_uptime_s,
+        previous->last_confirm_uptime_s,
+        previous->light_sleep_enabled,
+        previous->light_sleeps,
+        (uint32_t)(previous->light_sleep_us / 1000000U),
+        previous->longest_light_sleep_ms,
+        previous->last_wakeup_causes
+    );
+}
+
+/* Report both sources, never whichever one happens to be valid.
+ *
+ * A USB reset - reset reason 11, which is what idf.py monitor performs when it
+ * opens the port - keeps RTC RAM. So the readout sequence poisons its own
+ * evidence: attaching the cable is a power-on reset that wipes RTC RAM and
+ * reads NVS, but that boot line is emitted while the port is still enumerating
+ * and nobody sees it; the monitor then resets over USB, RTC RAM survives from
+ * the few seconds the board was up, and every boot from then on reports that
+ * stub run in preference to the field run sitting in NVS. Reset as often as
+ * you like was true of the stored snapshot and false of what got printed.
+ *
+ * The two sources answer different questions and neither substitutes for the
+ * other: RTC RAM is the more recent, and is the only record of a run the node
+ * ended itself with esp_restart(); NVS is frozen while USB is attached and is
+ * therefore the only record of a run on external power. Print both. */
 static void report_boot_diagnostics(void)
 {
     esp_reset_reason_t reason = esp_reset_reason();
-    epsolar_diag_t previous;
-    const char *source;
+    epsolar_diag_t retained = s_diag;
+    epsolar_diag_t stored;
+    bool have_retained = retained.magic == EPSOLAR_DIAG_MAGIC;
+    bool have_stored = load_diagnostics(&stored);
 
-    if (s_diag.magic == EPSOLAR_DIAG_MAGIC) {
-        previous = s_diag;
-        source = "RTC RAM";
-    } else if (load_diagnostics(&previous)) {
-        source = "NVS, as of its last cycle";
-    } else {
-        previous = (epsolar_diag_t){0};
-        source = NULL;
+    if (have_retained) {
+        log_previous_run("RTC RAM", reason, &retained);
+    }
+    if (have_stored) {
+        log_previous_run("NVS, as of its last cycle", reason, &stored);
+    }
+    if (!have_retained && !have_stored) {
+        ESP_LOGI(TAG, "Boot 1 (reset reason %d); no retained diagnostics", reason);
     }
 
-    if (source == NULL) {
-        ESP_LOGI(TAG, "Boot 1 (reset reason %d); no retained diagnostics", reason);
-    } else {
-        ESP_LOGW(
-            TAG,
-            "Boot %" PRIu32 " (reset reason %d, history 0x%08" PRIx32
-            "); previous run (%s): cycles=%" PRIu32
-            " modbus_failures=%" PRIu32 " publish_failures=%" PRIu32
-            " report_confirms=%" PRIu32 " report_failures=%" PRIu32
-            " last_probe_status=0x%02x announces=%" PRIu32 " rejoins=%" PRIu32
-            " stall_restarts=%" PRIu32 " last_cycle=%" PRIu32 "s last_publish=%" PRIu32
-            "s last_confirm=%" PRIu32 "s light_sleep=%d light_sleeps=%" PRIu32
-            " slept=%" PRIu32 "s longest_sleep=%" PRIu32 "ms wakeup_causes=0x%08" PRIx32,
-            previous.boots + 1,
-            reason,
-            previous.reset_reasons,
-            source,
-            previous.cycles,
-            previous.modbus_failures,
-            previous.publish_failures,
-            previous.report_confirms,
-            previous.report_failures,
-            previous.last_probe_status,
-            previous.announces,
-            previous.rejoins,
-            previous.stall_restarts,
-            previous.last_cycle_uptime_s,
-            previous.last_publish_uptime_s,
-            previous.last_confirm_uptime_s,
-            previous.light_sleep_enabled,
-            previous.light_sleeps,
-            (uint32_t)(previous.light_sleep_us / 1000000U),
-            previous.longest_light_sleep_ms,
-            previous.last_wakeup_causes
-        );
+    /* Counters continue from the fresher source. RTC RAM outranks NVS when it
+     * survived, because NVS lags it by up to EPSOLAR_DIAG_SAVE_CYCLES. */
+    epsolar_diag_t previous = (epsolar_diag_t){0};
+    if (have_retained) {
+        previous = retained;
+    } else if (have_stored) {
+        previous = stored;
     }
 
     s_diag = (epsolar_diag_t){
@@ -241,6 +266,16 @@ static void report_boot_diagnostics(void)
         .stall_restarts = previous.stall_restarts,
         .reset_reasons = (previous.reset_reasons << 8) | (uint8_t)reason,
     };
+
+    /* A run that dies before its first telemetry cycle otherwise leaves nothing
+     * at all: save_diagnostics() is only reached from the cycle loop and the
+     * repair ladder, and the cycle loop only starts once the node has joined.
+     * Stamping the boot here makes "booted, never joined" - cycles=0 with a
+     * boots that moved - distinguishable from "never booted", and keeps the
+     * reset-reason history unbroken across a run that never cycles. Refuses to
+     * write while USB is attached, like every other save, so the snapshot being
+     * read out survives this. */
+    save_diagnostics();
 }
 
 /* Decide once at boot: a USB host present means the no-sleep reference run,
