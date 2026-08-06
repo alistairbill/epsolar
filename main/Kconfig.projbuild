@@ -7,26 +7,29 @@ config EPSOLAR_UPDATE_INTERVAL_SECONDS
     help
         Time between Modbus reads and Zigbee attribute updates.
 
-config EPSOLAR_ZIGBEE_FAST_POLL_MS
-    int "Sleepy end device fast poll interval (milliseconds)"
-    range 100 7000
-    default 1000
+config EPSOLAR_ZIGBEE_IDLE_POLL_MS
+    int "Sleepy end device idle poll interval (milliseconds)"
+    range 1000 60000
+    default 5000
     help
-        How often the node polls its parent while fast polling. The library
-        defaults this to 200 ms and never falls back to the long poll interval,
-        so in practice this sets the idle wake rate: two wakes per interval,
-        indefinitely.
+        How often the node polls its parent between telemetry cycles. The
+        library never leaves fast poll (espressif/esp-zigbee-sdk#782), so the
+        fast poll interval is the idle wake rate, and this value - applied
+        once each cycle's APS ack exchange has finished - is what the light
+        sleep length comes from. Joining, rejoining and the ack exchange
+        itself always run at the 200 ms library default instead: association
+        and rejoin responses must be fetched within macResponseWaitTime,
+        about 491 ms, and the parent discards an APS ack after
+        macTransactionPersistenceTime, 7.68 s.
 
-        The range is not arbitrary. A parent discards an indirect transaction
-        after macTransactionPersistenceTime, 7.68 s, so any value at or beyond
-        that guarantees the APS ack is destroyed before the node arrives to
-        collect it, and every report comes back 0xa7. The APS layer's own ack
-        wait is shorter still and is the real ceiling, but its value in this
-        stack is unverified.
-
-        The only interval known to deliver acks on this node is the 200 ms
-        default. Walk this up one step at a time and watch probe_ok against
-        probe_fail in the cycle line; back off as soon as failures appear.
+        The 5 s default sits below that 7.68 s persistence with margin: the
+        parent holds any downlink frame - an unsolicited read, OTA, a
+        Configure Reporting - long enough for the node's next poll to collect
+        it, so downlink stays reliable. Push past 7.68 s and downlink frames start
+        being discarded before a poll arrives. At any idle-length interval
+        the rejoins the stack starts on its own after a parent link flap
+        already miss the 491 ms deadline; the repair ladder recovers those by
+        steering at 200 ms, but only after minutes of silence.
 
 config EPSOLAR_LIGHT_SLEEP
     bool "Enable automatic light sleep"

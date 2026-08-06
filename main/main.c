@@ -53,16 +53,27 @@
  * keepalive setter, so the two names are the same knob. It must stay well
  * inside the ed_timeout below, or the parent ages the node out between polls. */
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
-/* The library defaults this to 200 ms and never falls back to the long poll
- * interval above (espressif/esp-zigbee-sdk#782, #215), so in practice it sets
- * the idle wake rate: two wakes per interval, indefinitely.
+/* The library defaults fast poll to 200 ms and never falls back to the long
+ * poll interval above (espressif/esp-zigbee-sdk#782, #215), so the fast poll
+ * interval is the idle wake rate. Fast poll cannot simply be stopped either -
+ * it is the only receive window a sleepy end device has, and stopping it was
+ * tried and made everything worse. So the interval is driven like a gearbox
+ * instead:
  *
- * Fast poll cannot simply be stopped. It is the only receive window a sleepy
- * end device has, and without it the APS ack is discarded by the parent after
- * macTransactionPersistenceTime, 7.68 s, long before a 60 s long poll comes
- * round. So the interval is the only lever, and it is configurable because the
- * usable value has to be found by walking it up against probe_ok/probe_fail. */
-#define EPSOLAR_ZIGBEE_FAST_POLL_MS CONFIG_EPSOLAR_ZIGBEE_FAST_POLL_MS
+ * - The active rate while commissioning and during each cycle's report
+ *   window. Association and rejoin responses are indirect transmissions that
+ *   must be fetched within macResponseWaitTime, ~491 ms - builds that polled
+ *   at 1000 ms never joined - and the APS ack for anything just sent is
+ *   discarded by the parent after macTransactionPersistenceTime, 7.68 s. The
+ *   report window holds the chip awake for all of this anyway, so fast polls
+ *   cost nothing extra and end the window sooner.
+ * - The idle rate from the probe's confirm to the next cycle, when nothing is
+ *   outstanding: this is what the light sleep length comes from. A window
+ *   that ends without a confirm - the probe was rejected, or the failsafe
+ *   timeout fired - leaves the active rate in place until the next cycle,
+ *   because the link is suspect exactly then. */
+#define EPSOLAR_ZIGBEE_IDLE_POLL_MS CONFIG_EPSOLAR_ZIGBEE_IDLE_POLL_MS
+#define EPSOLAR_ZIGBEE_ACTIVE_POLL_MS 200
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 /* Hold out for a parent with some link margin, not one at the edge of hearing. */
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 40
@@ -1134,6 +1145,20 @@ static const char *aps_status_name(uint8_t status)
     }
 }
 
+/* Caller holds the Zigbee stack lock. Every rate change passes through here so
+ * the transitions are visible in the log. A rejoin the stack starts on its own
+ * runs at whatever rate is current - at the idle rate it will fail its
+ * response fetch, and the repair ladder recovers that by steering at the
+ * active rate. */
+static void set_fast_poll_locked(uint32_t interval_ms)
+{
+    if (ezb_nwk_get_fast_poll_interval() == interval_ms) {
+        return;
+    }
+    ezb_nwk_set_fast_poll_interval(interval_ms);
+    ESP_LOGI(TAG, "Fast poll interval now %" PRIu32 "ms", ezb_nwk_get_fast_poll_interval());
+}
+
 /* Progress through the repair ladder since the last confirmed delivery. */
 static struct {
     uint32_t last_repair_uptime_s;
@@ -1151,8 +1176,10 @@ static void link_probe_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
     (void)user_ctx;
     /* The confirm is the end of the cycle's ack exchange whichever way it
      * went: success, or 0xa7 after the stack's APS retries have exhausted.
-     * Either way there is nothing left to stay awake for. */
+     * Either way there is nothing left to stay awake for, and nothing further
+     * to poll quickly for until the next cycle. */
     close_report_window();
+    set_fast_poll_locked(EPSOLAR_ZIGBEE_IDLE_POLL_MS);
     s_diag.last_probe_status = cnf->status;
     if (cnf->status == 0) {
         s_diag.report_confirms++;
@@ -1407,6 +1434,10 @@ static void telemetry_task(void *arg)
          * here says whether the node fast polled through the whole idle gap. */
         esp_zigbee_lock_acquire(portMAX_DELAY);
         bool fast_polling_on_wake = nwk_pim_is_fast_poll_running() != 0;
+        /* Back into gear for the exchange: the report burst and the probe are
+         * about to put APS acks in flight, and those have to be fetched well
+         * inside the parent's 7.68 s persistence. The confirm shifts back. */
+        set_fast_poll_locked(EPSOLAR_ZIGBEE_ACTIVE_POLL_MS);
         esp_zigbee_lock_release();
         open_report_window();
         err = epsolar_read_telemetry(&modbus, &telemetry);
@@ -1493,7 +1524,12 @@ static void start_telemetry_task(void)
 /* Every (re)join is a repair, whether this application asked for it or the
  * stack rejoined on its own: announce the node so the network stops routing to
  * the router that used to be its parent, and give the repair ladder a fresh
- * window in which a confirmation can arrive. Caller holds the stack lock. */
+ * window in which a confirmation can arrive. Caller holds the stack lock.
+ *
+ * The poll interval is left at the active rate it already has - commissioning
+ * runs on it - so the traffic a join attracts, the coordinator's Configure
+ * Reporting included, lands while polls are still fast; the first probe
+ * confirm is what drops to the idle rate. */
 static void on_network_joined(void)
 {
     announce_presence_locked();
@@ -1514,6 +1550,10 @@ static void commissioning_retry_task(void *arg)
     uint8_t mode = (uint8_t)(uintptr_t)arg;
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_zigbee_lock_acquire(portMAX_DELAY);
+    /* Steering ends in association or rejoin, and their responses must be
+     * fetched inside macResponseWaitTime; the idle rate misses that deadline
+     * by an order of magnitude. */
+    set_fast_poll_locked(EPSOLAR_ZIGBEE_ACTIVE_POLL_MS);
     ezb_err_t err = ezb_bdb_start_top_level_commissioning(mode);
     esp_zigbee_lock_release();
     if (err != EZB_ERR_NONE) {
@@ -1689,30 +1729,23 @@ static void zigbee_task(void *arg)
             : ESP_FAIL
     );
     ezb_nwk_set_rx_on_when_idle(false);
-    /* Set again through the runtime setter, having already been passed as
-     * zed_config.keep_alive to esp_zigbee_init() above. The node was observed
-     * waking roughly ten times a second between telemetry cycles - 662 light
-     * sleeps in 65 idle seconds, none longer than 99 ms - which is two wakes
-     * per 200 ms, the documented default fast poll interval, sustained
-     * indefinitely. A sleepy end device is supposed to fast poll only long
-     * enough to collect the APS ack for something it just sent and then fall
-     * back to its keepalive; this one never falls back. Whether the config
-     * field reaches the stack at all is the cheaper of the two explanations to
-     * eliminate, so assert the interval explicitly and log what the stack
-     * actually holds. */
+    /* The stack starts in the commissioning path - resume, rejoin or
+     * association - so it must start on the active rate. Asserted rather than
+     * trusted: the 200 ms library default is load-bearing, and a release that
+     * changed it would otherwise break joining silently. The first probe
+     * confirm is what shifts to the idle rate. */
     /* The long poll interval is read, not set: zed_config.keep_alive was
      * confirmed to reach the stack intact, so the setter that proved it is
      * gone. The read stays, because a wrong long poll interval would look
      * identical to the fast poll defect from the outside. */
-    uint32_t fast_poll_before = ezb_nwk_get_fast_poll_interval();
-    ezb_nwk_set_fast_poll_interval(EPSOLAR_ZIGBEE_FAST_POLL_MS);
+    ezb_nwk_set_fast_poll_interval(EPSOLAR_ZIGBEE_ACTIVE_POLL_MS);
     ESP_LOGW(
         TAG,
         "SED poll configuration: long poll %" PRIu32 "ms, fast poll %" PRIu32
-        "ms -> %" PRIu32 "ms",
+        "ms active, %ums idle",
         ezb_nwk_get_keepalive_interval(),
-        fast_poll_before,
-        ezb_nwk_get_fast_poll_interval()
+        ezb_nwk_get_fast_poll_interval(),
+        (unsigned)EPSOLAR_ZIGBEE_IDLE_POLL_MS
     );
     ezb_aps_secur_enable_distributed_security(false);
     ezb_nwk_set_min_join_lqi(EPSOLAR_ZIGBEE_MIN_JOIN_LQI);
