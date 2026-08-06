@@ -59,8 +59,17 @@
 /* The long poll interval: how often the node polls its parent when it is not
  * fast polling. esp_zb_set_default_long_poll_interval() is a macro over the
  * keepalive setter, so the two names are the same knob. It is very nearly
- * decorative here, because the node never leaves fast poll to use it. */
-#define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS CONFIG_EPSOLAR_ZIGBEE_KEEP_ALIVE_MS
+ * decorative here, because the node never leaves fast poll to use it.
+ *
+ * Fixed, and paired with the 8 minute ed_timeout below. Raising it is the
+ * workaround circulating for espressif/esp-zigbee-sdk#782, and it does not
+ * apply here: that device is idle and wedges when its long poll first fires,
+ * whereas this one transmits every cycle and its own traffic starts fast poll
+ * regardless. Its light sleeps have never once exceeded 99 ms, from the first
+ * cycle onwards, so nothing here waited for a long poll boundary to go wrong.
+ * Anything much above the ed_timeout would also get the node aged out by its
+ * parent, so the two move together or not at all. */
+#define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
 /* Slow fast poll down rather than trying to escape it.
  *
  * The library defaults this to 200 ms and never falls back to the long poll
@@ -1669,33 +1678,6 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
     return true;
 }
 
-/* The parent ages a child out after ed_timeout without a keepalive poll, so the
- * timeout has to outlast the long poll interval or the node is simply dropped -
- * which is the part the "set keep_alive to an hour" workaround leaves out.
- * Derive it rather than leaving two coupled constants to drift apart: pick the
- * shortest timeout covering two poll intervals, and never go below the 8
- * minutes this node has always used, so the default configuration is unchanged. */
-static uint8_t end_device_timeout_for(uint32_t keep_alive_ms)
-{
-    static const struct {
-        uint8_t value;
-        uint32_t seconds;
-    } timeouts[] = {
-        {EZB_NWK_ED_TIMEOUT_8MIN, 480},
-        {EZB_NWK_ED_TIMEOUT_16MIN, 960},
-        {EZB_NWK_ED_TIMEOUT_32MIN, 1920},
-        {EZB_NWK_ED_TIMEOUT_64MIN, 3840},
-        {EZB_NWK_ED_TIMEOUT_128MIN, 7680},
-    };
-    uint32_t required_s = (keep_alive_ms / 1000U) * 2U;
-    for (size_t i = 0; i < sizeof(timeouts) / sizeof(timeouts[0]); ++i) {
-        if (timeouts[i].seconds >= required_s) {
-            return timeouts[i].value;
-        }
-    }
-    return EZB_NWK_ED_TIMEOUT_128MIN;
-}
-
 static void zigbee_task(void *arg)
 {
     esp_zigbee_config_t config = {
@@ -1708,7 +1690,7 @@ static void zigbee_task(void *arg)
                  * minutes cannot receive anything: the parent holds indirect
                  * transactions for 7.68 s. Poll on the telemetry cadence, so
                  * downlink works and a dead parent is noticed in minutes. */
-                .ed_timeout = end_device_timeout_for(EPSOLAR_ZIGBEE_KEEP_ALIVE_MS),
+                .ed_timeout = EZB_NWK_ED_TIMEOUT_8MIN,
                 .keep_alive = EPSOLAR_ZIGBEE_KEEP_ALIVE_MS,
             },
         },

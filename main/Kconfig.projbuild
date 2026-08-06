@@ -7,25 +7,6 @@ config EPSOLAR_UPDATE_INTERVAL_SECONDS
     help
         Time between Modbus reads and Zigbee attribute updates.
 
-config EPSOLAR_ZIGBEE_KEEP_ALIVE_MS
-    int "Sleepy end device long poll interval (milliseconds)"
-    range 1000 3600000
-    default 60000
-    help
-        How often the node polls its parent when it is not fast polling.
-
-        The workaround circulating for espressif/esp-zigbee-sdk#782 is to set
-        this extremely high - one hour - which delays whatever it is about the
-        long poll firing that wedges the device into permanent fast poll. It is
-        offered here so that can be tested, but note that this node is not the
-        idle device in that report: it transmits every telemetry cycle, and its
-        own traffic starts fast poll regardless of this value.
-
-        The end device timeout is derived from this automatically. A parent ages
-        a child out after that timeout without a keepalive poll, so a long poll
-        interval that outlasts it loses the node entirely - which is the trap in
-        raising this value on its own.
-
 config EPSOLAR_ZIGBEE_FAST_POLL_MS
     int "Sleepy end device fast poll interval (milliseconds)"
     range 100 7000
