@@ -58,8 +58,26 @@
 #define EPSOLAR_REPORT_WINDOW_TIMEOUT_MS 15000
 /* The long poll interval: how often the node polls its parent when it is not
  * fast polling. esp_zb_set_default_long_poll_interval() is a macro over the
- * keepalive setter, so the two names are the same knob. */
+ * keepalive setter, so the two names are the same knob. It is very nearly
+ * decorative here, because the node never leaves fast poll to use it. */
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
+/* Slow fast poll down rather than trying to escape it.
+ *
+ * The library defaults this to 200 ms and never falls back to the long poll
+ * interval above - a known, still open defect, reported on this exact board in
+ * espressif/esp-zigbee-sdk#782 and again in #215. Two wakes per period means
+ * about ten a second, indefinitely, and that is where this node's idle power
+ * goes.
+ *
+ * Escaping fast poll properly was tried and is not available: stopping it costs
+ * the node the only receive window it has, every probe after the stop failed,
+ * and the stack thrashed on retries instead of sleeping. So the interval is the
+ * lever, and the constraint on it is the parent, not this node - an indirect
+ * transaction is discarded after macTransactionPersistenceTime, 7.68 s, and the
+ * APS layer will retry a frame whose ack it has not seen well before that. 1 s
+ * keeps both of those comfortably in hand and still takes the wake rate down
+ * fivefold. Raise it only against evidence that acks still arrive. */
+#define EPSOLAR_ZIGBEE_FAST_POLL_MS 1000
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 /* Hold out for a parent with some link margin, not one at the edge of hearing. */
 #define EPSOLAR_ZIGBEE_MIN_JOIN_LQI 40
@@ -98,29 +116,22 @@
 static const char *TAG = "epsolar_zigbee";
 static bool telemetry_task_started;
 
-/* The poll interval manager, which no public header exposes.
+/* The poll interval manager, which no public header exposes. Signature read off
+ * the disassembly, since nothing declares it: it touches a0 only to return
+ * through it, so it takes no argument, and the result is taken as int rather
+ * than bool so nothing depends on the callee having narrowed it. A future
+ * release that drops the symbol breaks the link, which is the right way for
+ * this to fail.
  *
- * A sleepy end device is supposed to fast poll only long enough to collect what
- * it is waiting for and then drop back to its long poll interval. This one
- * never drops back: the long poll interval reads correctly as 60 s, and the
- * node still wakes about ten times a second forever. It is a known and still
- * open defect - espressif/esp-zigbee-sdk#782 reports it on this exact board,
- * and #215 reports the same thing - and the workaround in circulation is to
- * forbid fast polling outright, which breaks anything that legitimately needs
- * it, this node's APS acks included.
- *
- * The 2.x library exports a better lever than the one those issues use. Rather
- * than forbidding fast poll for the life of the device, stop it at the one
- * moment the application knows the exchange is over, and let the stack start it
- * again by itself the next time there is something to collect.
- *
- * Signatures are read off the disassembly rather than guessed at, because
- * nothing declares them: nwk_pim_start_fast_poll opens with "mv s0,a0" and so
- * takes an argument, while both of these touch a0 only to return through it.
- * The return is taken as int, not bool, so nothing depends on the callee having
- * narrowed it. If a future release drops either symbol the link fails, which is
- * the right way for this to break. */
-extern void nwk_pim_stop_fast_poll(void);
+ * Only the predicate is used. nwk_pim_stop_fast_poll() was called from
+ * link_probe_confirm() on the reasoning that the confirm marks the end of the
+ * exchange and the stack would start fast poll again by itself next cycle. It
+ * does not. Cycle 1 confirmed, the stop ran, and all four subsequent probes
+ * failed - and the node then barely slept at all, one sleep of 29 ms in 243 s,
+ * because a stack that cannot complete its APS transactions retries instead of
+ * going idle. Stopping fast poll costs the node its only receive window: the
+ * parent discards an indirect transaction after macTransactionPersistenceTime,
+ * 7.68 s, and a node back on a 60 s long poll never comes to collect it. */
 extern int nwk_pim_is_fast_poll_running(void);
 
 /* Reading these back costs a power cycle: USB cannot be attached while the
@@ -1180,15 +1191,7 @@ static void link_probe_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
     (void)user_ctx;
     /* The confirm is the end of the cycle's ack exchange whichever way it
      * went: success, or 0xa7 after the stack's APS retries have exhausted.
-     * Either way there is nothing left to stay awake for.
-     *
-     * Drop out of fast poll before releasing the lock, so the chip is not left
-     * free to sleep while the radio is still polling five times a second. This
-     * runs in the stack task with the stack lock held, which is the only
-     * context a stack internal may be called from - and it is why the timeout
-     * and command-rejected paths do not do the same. Both are exceptional, and
-     * the next cycle's confirm clears up after them. */
-    nwk_pim_stop_fast_poll();
+     * Either way there is nothing left to stay awake for. */
     close_report_window();
     s_diag.last_probe_status = cnf->status;
     if (cnf->status == 0) {
@@ -1709,15 +1712,18 @@ static void zigbee_task(void *arg)
      * field reaches the stack at all is the cheaper of the two explanations to
      * eliminate, so assert the interval explicitly and log what the stack
      * actually holds. */
-    /* Read back rather than set. zed_config.keep_alive was confirmed to reach
-     * the stack intact - it reads 60000 ms before anything touches it - so the
-     * explicit setter that proved it has been removed. The read stays: a wrong
-     * long poll interval would look exactly like the fast poll defect from the
-     * outside, and this is what rules it out in one line. */
+    /* The long poll interval is read, not set: zed_config.keep_alive was
+     * confirmed to reach the stack intact, so the setter that proved it is
+     * gone. The read stays, because a wrong long poll interval would look
+     * identical to the fast poll defect from the outside. */
+    uint32_t fast_poll_before = ezb_nwk_get_fast_poll_interval();
+    ezb_nwk_set_fast_poll_interval(EPSOLAR_ZIGBEE_FAST_POLL_MS);
     ESP_LOGW(
         TAG,
-        "SED poll configuration: long poll %" PRIu32 "ms, fast poll %" PRIu32 "ms",
+        "SED poll configuration: long poll %" PRIu32 "ms, fast poll %" PRIu32
+        "ms -> %" PRIu32 "ms",
         ezb_nwk_get_keepalive_interval(),
+        fast_poll_before,
         ezb_nwk_get_fast_poll_interval()
     );
     ezb_aps_secur_enable_distributed_security(false);
