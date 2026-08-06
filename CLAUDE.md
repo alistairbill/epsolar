@@ -107,6 +107,12 @@ succeeds against a dead radio, and `ezb_bdb_dev_joined()` returns true with a de
 So each cycle sends one APS-confirmed Report Attributes to the coordinator
 (`send_link_probe`), and `link_probe_confirm` is the only liveness clock.
 
+`arm_stall_watchdog()` is armed *before* `epsolar_modbus_init()`, not after. That retry
+loop never gives up and logs to a console nobody reads on external power, so an init that
+cannot succeed otherwise leaves the node joined, announced, online in zigbee2mqtt and
+silent indefinitely with nothing watching it. It still does not cover a node that never
+joins — the telemetry task is never created in that case.
+
 `check_link_health()` escalates one step per `EPSOLAR_LINK_STALL_S` of silence:
 Device_annce (repairs the common half-dead state where a secure rejoin kept the short
 address and downlink still routes to the old parent) → rejoin via BDB network steering

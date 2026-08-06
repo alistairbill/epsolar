@@ -124,7 +124,14 @@ reading, and `stage` is the only thing that says where it stopped:
 
 `stage=4` with `cycles=0` is the one that means the wiring is fine and the first
 transaction is what hangs. `stage=3` that never advances means Modbus init is
-failing in a loop — on external power, with no console to say so.
+failing in a loop — on external power, with no console to say so. The stall
+watchdog covers that loop, so `stage=3` with `stall_restarts` climbing is the
+signature: it is retrying, failing, and being restarted every three intervals.
+
+Note the one gap the watchdog still does not cover: a node that never joins
+never starts the telemetry task, so nothing restarts it. That case shows as
+`stage=2` and only the Zigbee stack's own commissioning retries are working on
+it.
 
 Otherwise read `cycles`, `light_sleeps`, `report_confirms`:
 
@@ -133,7 +140,7 @@ Otherwise read `cycles`, `light_sleeps`, `report_confirms`:
 | `cycles` large, `light_sleeps` large, `report_confirms` frozen low | App alive and sleeping fine, **radio path died**. Downlink/ack problem. |
 | `cycles` ≈ 3, `last_cycle` ≈ 180s, `light_sleeps` small but non-zero | **Chip stopped waking.** Wedged in or after a light sleep. |
 | `light_sleeps=0` | Light sleep never engaged. The fault is something else entirely. |
-| `stall_restarts` > 0 and the `run` number climbing | App was hanging; the watchdog kept recovering it. |
+| `stall_restarts` > 0 and the `run` number climbing | App was hanging; the watchdog kept recovering it. Read `stage` to see where. |
 | `slept` ≈ `last_cycle` | Sleeping essentially all the time. Normal and healthy. |
 
 Supporting fields:

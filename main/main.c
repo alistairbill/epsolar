@@ -1323,6 +1323,22 @@ static void telemetry_task(void *arg)
      * scheduled, which is what the stage is there to record. */
     record_stage(EPSOLAR_STAGE_JOINED);
 
+    /* Armed before Modbus initialisation rather than after it. The retry loop
+     * below never gives up, and on external power it logs to a console nobody
+     * is reading, so an initialisation that cannot succeed used to leave the
+     * node joined, announced, online in zigbee2mqtt and silent for as long as
+     * the supply lasted, with nothing watching it at all. Covering the loop
+     * turns that into a restart every EPSOLAR_STALL_RESTART_CYCLES intervals
+     * and a stall_restarts count that says so out loud. Initialisation is a
+     * local UART and driver setup that does not talk to the controller, so it
+     * has no legitimate reason to take three minutes. */
+    const esp_timer_create_args_t stall_timer = {
+        .callback = telemetry_stalled,
+        .name = "epsolar_stall",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&stall_timer, &s_stall_timer));
+    arm_stall_watchdog();
+
     epsolar_modbus_t modbus = {0};
     esp_err_t err;
     while ((err = epsolar_modbus_init(&modbus)) != ESP_OK) {
@@ -1336,12 +1352,8 @@ static void telemetry_task(void *arg)
     }
 
     record_stage(EPSOLAR_STAGE_MODBUS_READY);
-
-    const esp_timer_create_args_t stall_timer = {
-        .callback = telemetry_stalled,
-        .name = "epsolar_stall",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&stall_timer, &s_stall_timer));
+    /* Fresh deadline, so the first cycle gets a full window rather than
+     * whatever initialisation left of one. */
     arm_stall_watchdog();
 
     TickType_t last_wake = xTaskGetTickCount();
