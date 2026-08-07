@@ -91,12 +91,12 @@ that sustains the CPU but sags on RF transmit bursts, and it fits the
 unexplained brownout (reset reason `9`) in the reset history.
 
 Not proven — one 1h45m run is not proof it would never fail on USB, and the
-failure is not a clean brownout. But it is the best-supported hypothesis on the
-table, and it is cheap to test: **run `c74cac1` unchanged on external power with
-light sleep off.** If it dies at 20-30 minutes, the firmware is exonerated and
-the problem is the supply. Bulk capacitance at the board's supply pins
-(100-470 uF electrolytic plus 100 nF ceramic) is the standard remedy and has
-never been tried.
+failure is not a clean brownout. The c74cac1-on-external test was attempted on
+7 Aug but ran with light sleep on and died in its first light sleep (see lead
+0) — the original never-wakes fault, not failure B — so it decided nothing
+about the supply. Bulk capacitance at the board's supply pins (100-470 uF
+electrolytic plus 100 nF ceramic) is the standard remedy and has never been
+tried.
 
 ## Ruled out, with evidence
 
@@ -152,9 +152,23 @@ never been tried.
 
 ## Open leads
 
-0. **The supply.** See the comparison above. The `c74cac1`-on-external test has
-   been run (7 Aug); record its outcome here — it decides whether the firmware
-   or the supply owns failure B.
+0. **The supply.** The `c74cac1`-on-external test was run on 7 Aug, but not as
+   prescribed: the sdkconfig had light sleep ON (`light_sleep=1` in the
+   readout). Result — cycle 1 completed at 3 s, Modbus and publish fine, the
+   probe's confirm never arrived (`report_confirms=0`), and the node froze at
+   `cycles=1` with `light_sleeps=0`. That zero is meaningful: the counter
+   increments on sleep *exit*, and c74cac1's own comment defines the signature
+   — "cycles that stop with light_sleeps frozen means the chip never came back
+   out of sleep." c74cac1 has neither the startup lock nor the report window,
+   so nothing held the chip awake while the APS ack was in flight; it entered
+   its first light sleep and never woke. So this run reproduced the *original*
+   never-wakes fault, which the branch has since fixed (run 20 survived 2162
+   sleeps), and it neither convicts nor exonerates the supply for failure B.
+   The supply hypothesis still rests on run 13 vs the 1h45m USB run, both
+   sleep-off. The `4504bf8` field run now supersedes a c74cac1 rerun: every
+   failing external run to date carried the 15-report load, so if B persists
+   without it the supply is effectively confirmed (bulk capacitance next), and
+   if B disappears the traffic was the trigger.
 1. **Traffic volume — being tested (commit `4504bf8`, 7 Aug).**
    `configure_local_reporting()` re-armed all 15 attributes with a **zero
    reportable change**, so every cycle emitted ~15 APS-acked reports plus the
