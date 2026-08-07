@@ -7,40 +7,15 @@ config EPSOLAR_UPDATE_INTERVAL_SECONDS
     help
         Time between Modbus reads and Zigbee attribute updates.
 
-config EPSOLAR_ZIGBEE_IDLE_POLL_MS
-    int "Sleepy end device idle poll interval (milliseconds)"
-    range 1000 60000
-    default 5000
-    help
-        How often the node polls its parent between telemetry cycles. The
-        library never leaves fast poll (espressif/esp-zigbee-sdk#782), so the
-        fast poll interval is the idle wake rate, and this value - applied
-        once each cycle's APS ack exchange has finished - is what the light
-        sleep length comes from. Joining, rejoining and the ack exchange
-        itself always run at the 200 ms library default instead: association
-        and rejoin responses must be fetched within macResponseWaitTime,
-        about 491 ms, and the parent discards an APS ack after
-        macTransactionPersistenceTime, 7.68 s.
-
-        The 5 s default sits below that 7.68 s persistence with margin: the
-        parent holds any downlink frame - an unsolicited read, OTA, a
-        Configure Reporting - long enough for the node's next poll to collect
-        it, so downlink stays reliable. Push past 7.68 s and downlink frames start
-        being discarded before a poll arrives. At any idle-length interval
-        the rejoins the stack starts on its own after a parent link flap
-        already miss the 491 ms deadline; the repair ladder recovers those by
-        steering at 200 ms, but only after minutes of silence.
-
 config EPSOLAR_REPORT_PACING_MS
     int "Gap between report transmissions (milliseconds)"
     range 0 1000
     default 50
     help
-        Pause after each attribute write and each reporting-record arm during
-        a telemetry cycle, with the Zigbee stack lock released so the
-        mainloop transmits the report the write fired before the next one is
-        queued. Zero paces nothing: the cycle's ~16 frames leave the radio
-        back to back.
+        Pause after each attribute write during a telemetry cycle, with the
+        Zigbee stack lock released so the mainloop transmits any report the
+        write fired before the next one is queued. Zero paces nothing: the
+        cycle's frames leave the radio back to back.
 
         The back-to-back burst is the sharpest load the node puts on its
         supply and is fatal on a supply that sags under it; paced single

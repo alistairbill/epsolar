@@ -59,9 +59,9 @@ into `epsolar_telemetry_t`, per-block `valid` bitmask) → `main.c` (`publish_te
 maps fields onto ZCL attributes).
 
 Any call touching the stack must hold `esp_zigbee_lock_acquire()`/`_release()`. The
-publish path (`set_attribute`, `configure_local_reporting`, `set_battery_power_descriptor`)
+publish path (`set_attribute`, `set_battery_power_descriptor`)
 and `send_link_probe` deliberately take and drop the lock **per command**, with an
-`EPSOLAR_REPORT_PACING_MS` pause after each write/arm — bursting reports under one hold
+`EPSOLAR_REPORT_PACING_MS` pause after each write — bursting reports under one hold
 drains the fixed out-buffer pool and starves the mainloop that would drain it, and the
 back-to-back radio burst released at the end of the hold is the sharpest supply load the
 node generates.
@@ -99,9 +99,14 @@ attribute at registration, and most non-temperature attributes do not ship with
 `EZB_ZCL_ATTR_ACCESS_REPORTING`. Without a slot, both Configure Reporting from the
 coordinator and `ezb_zcl_report_attr_cmd_req()` fail with `EZB_ERR_FAIL`.
 
-`configure_local_reporting()` then re-arms every entry in `reported_attributes[]` with a
-zero reportable change and its own intervals, because zigbee2mqtt's configuration yields
-on-change-only reports and a static array would otherwise go silent.
+Report emission rides entirely on the coordinator's Configure Reporting (zigbee2mqtt asks
+for min 10 s / max 300 s with deltas of 0.1 V / 0.1 A / 1 W-or-unit): an attribute write
+only produces a report when it moves by more than the configured delta. The max-interval
+heartbeat has not been observed to fire, so static values go quiet in zigbee2mqtt; the
+link probe is the only per-cycle frame and the only heartbeat. The firmware previously
+re-armed all 15 attributes locally with a zero reportable change, which made every cycle
+emit ~15 acknowledged reports; that was removed as the prime suspect for the parent-side
+APS-ack failures (`0xa7`).
 
 ## Link liveness and the repair ladder
 

@@ -25,8 +25,6 @@
 #include "solar.h"
 
 #define EPSOLAR_STORAGE_PARTITION "zb_storage"
-#define EPSOLAR_REPORT_MIN_INTERVAL_S 30
-#define EPSOLAR_REPORT_MAX_INTERVAL_S 180
 /* Nothing above the application notices when its frames stop reaching the
  * coordinator: attribute writes keep succeeding locally, so the confirmed link
  * probe is the only liveness signal. Repairs escalate one step per stall
@@ -53,27 +51,14 @@
  * keepalive setter, so the two names are the same knob. It must stay well
  * inside the ed_timeout below, or the parent ages the node out between polls. */
 #define EPSOLAR_ZIGBEE_KEEP_ALIVE_MS 60000
-/* The library defaults fast poll to 200 ms and never falls back to the long
- * poll interval above (espressif/esp-zigbee-sdk#782, #215), so the fast poll
- * interval is the idle wake rate. Fast poll cannot simply be stopped either -
- * it is the only receive window a sleepy end device has, and stopping it was
- * tried and made everything worse. So the interval is driven like a gearbox
- * instead:
- *
- * - The active rate while commissioning and during each cycle's report
- *   window. Association and rejoin responses are indirect transmissions that
- *   must be fetched within macResponseWaitTime, ~491 ms - builds that polled
- *   at 1000 ms never joined - and the APS ack for anything just sent is
- *   discarded by the parent after macTransactionPersistenceTime, 7.68 s. The
- *   report window holds the chip awake for all of this anyway, so fast polls
- *   cost nothing extra and end the window sooner.
- * - The idle rate from the probe's confirm to the next cycle, when nothing is
- *   outstanding: this is what the light sleep length comes from. A window
- *   that ends without a confirm - the probe was rejected, or the failsafe
- *   timeout fired - leaves the active rate in place until the next cycle,
- *   because the link is suspect exactly then. */
-#define EPSOLAR_ZIGBEE_IDLE_POLL_MS CONFIG_EPSOLAR_ZIGBEE_IDLE_POLL_MS
-#define EPSOLAR_ZIGBEE_ACTIVE_POLL_MS 200
+/* The stack never falls back from fast poll to the long poll interval
+ * (espressif/esp-zigbee-sdk#782, #215), so this is also the idle wake rate,
+ * and it cannot be stopped: fast poll is the only receive window a sleepy end
+ * device has. Two deadlines bound it - association and rejoin responses must
+ * be fetched inside macResponseWaitTime (~491 ms), and the parent discards a
+ * queued APS ack after macTransactionPersistenceTime (7.68 s). 200 ms is the
+ * only interval verified to meet both on this network. */
+#define EPSOLAR_ZIGBEE_FAST_POLL_MS 200
 #define EPSOLAR_REPORT_PACING_MS CONFIG_EPSOLAR_REPORT_PACING_MS
 #define EPSOLAR_MODBUS_INIT_RETRY_MS 5000
 /* Hold out for a parent with some link margin, not one at the edge of hearing. */
@@ -845,51 +830,6 @@ static void register_device(void)
     ESP_ERROR_CHECK(ezb_af_device_desc_register(device));
 }
 
-/* Attributes that zigbee2mqtt binds and expects reports for. The stack only
- * emits periodic reports when a reporting configuration survives in NVS, so
- * every cycle also pushes an explicit Report Attributes command; that is what
- * the espressif sensor examples do and it is independent of the coordinator's
- * reporting setup. */
-static const struct {
-    uint8_t endpoint;
-    uint16_t cluster;
-    uint16_t attribute;
-} reported_attributes[] = {
-    {EPSOLAR_ARRAY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID},
-    {EPSOLAR_ARRAY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID},
-    {EPSOLAR_ARRAY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID},
-    {EPSOLAR_LOAD_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID},
-    {EPSOLAR_LOAD_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID},
-    {EPSOLAR_LOAD_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_POWER_ID},
-    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_VOLTAGE_ID},
-    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ELECTRICAL_MEASUREMENT,
-     EZB_ZCL_ATTR_ELECTRICAL_MEASUREMENT_DC_CURRENT_ID},
-    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_TEMPERATURE_MEASUREMENT,
-     EZB_ZCL_ATTR_TEMPERATURE_MEASUREMENT_MEASURED_VALUE_ID},
-    {EPSOLAR_CONTROLLER_ENDPOINT, EZB_ZCL_CLUSTER_ID_TEMPERATURE_MEASUREMENT,
-     EZB_ZCL_ATTR_TEMPERATURE_MEASUREMENT_MEASURED_VALUE_ID},
-    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-     EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID},
-    {EPSOLAR_BATTERY_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
-    {EPSOLAR_BATTERY_STATUS_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
-    {EPSOLAR_CHARGING_STATUS_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
-    {EPSOLAR_DISCHARGING_STATUS_ENDPOINT, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-     EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID},
-};
-
-#define EPSOLAR_REPORTED_ATTRIBUTE_COUNT \
-    (sizeof(reported_attributes) / sizeof(reported_attributes[0]))
-
 /* Let the mainloop transmit the report the last write or arm fired before the
  * next one is queued. Unpaced, the cycle's ~16 frames leave the radio back to
  * back - the sharpest load the node puts on its supply. */
@@ -898,80 +838,6 @@ static void pace_report_burst(void)
 #if EPSOLAR_REPORT_PACING_MS > 0
     vTaskDelay(pdMS_TO_TICKS(EPSOLAR_REPORT_PACING_MS));
 #endif
-}
-
-/* Takes and drops the stack lock per attribute - arming an attribute fires a
- * report, so each arm is paced like a write. Returns true once every
- * attribute is armed, so the caller can keep retrying: the coordinator's
- * Configure Reporting is what creates the reporting records, and on a fresh
- * join it can land after our first telemetry cycle.
- *
- * zigbee2mqtt asks for min 10 s / max 300 s, but that configuration only
- * produces on-change reports here: the max-interval heartbeat never fires, so
- * a static solar array goes silent for as long as nothing moves. Re-arm every
- * reportable attribute locally with a zero reportable change, which makes the
- * stack emit on every telemetry cycle it sees a write, and re-assert the
- * intervals independently of whatever the coordinator configured. */
-static bool configure_local_reporting(void)
-{
-    uint32_t present = 0;
-    uint32_t armed = 0;
-    for (size_t i = 0; i < EPSOLAR_REPORTED_ATTRIBUTE_COUNT; ++i) {
-        esp_zigbee_lock_acquire(portMAX_DELAY);
-        ezb_zcl_reporting_info_t info = ezb_zcl_reporting_info_find(
-            reported_attributes[i].endpoint,
-            reported_attributes[i].cluster,
-            EZB_ZCL_CLUSTER_SERVER,
-            reported_attributes[i].attribute,
-            EZB_ZCL_STD_MANUF_CODE
-        );
-        if (info == EZB_ZCL_INVALID_REPORTING_INFO) {
-            esp_zigbee_lock_release();
-            continue;
-        }
-        present |= 1U << i;
-
-        ezb_zcl_attr_variable_t delta = {0};
-        ezb_err_t err = ezb_zcl_reporting_info_update(
-            info,
-            EPSOLAR_REPORT_MIN_INTERVAL_S,
-            EPSOLAR_REPORT_MAX_INTERVAL_S,
-            &delta
-        );
-        if (err != EZB_ERR_NONE) {
-            esp_zigbee_lock_release();
-            ESP_LOGW(
-                TAG,
-                "Unable to arm reporting for endpoint=%u cluster=0x%04x attribute=0x%04x: 0x%04x",
-                reported_attributes[i].endpoint,
-                reported_attributes[i].cluster,
-                reported_attributes[i].attribute,
-                err
-            );
-            continue;
-        }
-        ezb_zcl_reporting_start_attr_report(info);
-        esp_zigbee_lock_release();
-        pace_report_burst();
-        armed |= 1U << i;
-    }
-
-    static uint32_t logged_armed = UINT32_MAX;
-    if (armed != logged_armed) {
-        logged_armed = armed;
-        ESP_LOGW(
-            TAG,
-            "Reporting records present for %d/%d attributes (mask 0x%05" PRIx32 "); "
-            "armed %d at %us/%us with zero reportable change",
-            __builtin_popcount(present),
-            (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT,
-            present,
-            __builtin_popcount(armed),
-            EPSOLAR_REPORT_MIN_INTERVAL_S,
-            EPSOLAR_REPORT_MAX_INTERVAL_S
-        );
-    }
-    return __builtin_popcount(armed) == (int)EPSOLAR_REPORTED_ATTRIBUTE_COUNT;
 }
 
 /* Takes and drops the stack lock itself, per write, and paces afterwards: the
@@ -1137,11 +1003,6 @@ static bool publish_telemetry(const epsolar_telemetry_t *telemetry)
         );
     }
 
-    static bool reporting_configured;
-    if (!reporting_configured) {
-        reporting_configured = configure_local_reporting();
-    }
-
     return success;
 }
 
@@ -1170,20 +1031,6 @@ static const char *aps_status_name(uint8_t status)
     }
 }
 
-/* Caller holds the Zigbee stack lock. Every rate change passes through here so
- * the transitions are visible in the log. A rejoin the stack starts on its own
- * runs at whatever rate is current - at the idle rate it will fail its
- * response fetch, and the repair ladder recovers that by steering at the
- * active rate. */
-static void set_fast_poll_locked(uint32_t interval_ms)
-{
-    if (ezb_nwk_get_fast_poll_interval() == interval_ms) {
-        return;
-    }
-    ezb_nwk_set_fast_poll_interval(interval_ms);
-    ESP_LOGI(TAG, "Fast poll interval now %" PRIu32 "ms", ezb_nwk_get_fast_poll_interval());
-}
-
 /* Progress through the repair ladder since the last confirmed delivery. */
 static struct {
     uint32_t last_repair_uptime_s;
@@ -1201,10 +1048,8 @@ static void link_probe_confirm(ezb_af_user_cnf_t *cnf, void *user_ctx)
     (void)user_ctx;
     /* The confirm is the end of the cycle's ack exchange whichever way it
      * went: success, or 0xa7 after the stack's APS retries have exhausted.
-     * Either way there is nothing left to stay awake for, and nothing further
-     * to poll quickly for until the next cycle. */
+     * Either way there is nothing left to stay awake for. */
     close_report_window();
-    set_fast_poll_locked(EPSOLAR_ZIGBEE_IDLE_POLL_MS);
     s_diag.last_probe_status = cnf->status;
     if (cnf->status == 0) {
         s_diag.report_confirms++;
@@ -1459,10 +1304,6 @@ static void telemetry_task(void *arg)
          * here says whether the node fast polled through the whole idle gap. */
         esp_zigbee_lock_acquire(portMAX_DELAY);
         bool fast_polling_on_wake = nwk_pim_is_fast_poll_running() != 0;
-        /* Back into gear for the exchange: the report burst and the probe are
-         * about to put APS acks in flight, and those have to be fetched well
-         * inside the parent's 7.68 s persistence. The confirm shifts back. */
-        set_fast_poll_locked(EPSOLAR_ZIGBEE_ACTIVE_POLL_MS);
         esp_zigbee_lock_release();
         open_report_window();
         err = epsolar_read_telemetry(&modbus, &telemetry);
@@ -1549,12 +1390,7 @@ static void start_telemetry_task(void)
 /* Every (re)join is a repair, whether this application asked for it or the
  * stack rejoined on its own: announce the node so the network stops routing to
  * the router that used to be its parent, and give the repair ladder a fresh
- * window in which a confirmation can arrive. Caller holds the stack lock.
- *
- * The poll interval is left at the active rate it already has - commissioning
- * runs on it - so the traffic a join attracts, the coordinator's Configure
- * Reporting included, lands while polls are still fast; the first probe
- * confirm is what drops to the idle rate. */
+ * window in which a confirmation can arrive. Caller holds the stack lock. */
 static void on_network_joined(void)
 {
     announce_presence_locked();
@@ -1575,10 +1411,6 @@ static void commissioning_retry_task(void *arg)
     uint8_t mode = (uint8_t)(uintptr_t)arg;
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_zigbee_lock_acquire(portMAX_DELAY);
-    /* Steering ends in association or rejoin, and their responses must be
-     * fetched inside macResponseWaitTime; the idle rate misses that deadline
-     * by an order of magnitude. */
-    set_fast_poll_locked(EPSOLAR_ZIGBEE_ACTIVE_POLL_MS);
     ezb_err_t err = ezb_bdb_start_top_level_commissioning(mode);
     esp_zigbee_lock_release();
     if (err != EZB_ERR_NONE) {
@@ -1754,23 +1586,17 @@ static void zigbee_task(void *arg)
             : ESP_FAIL
     );
     ezb_nwk_set_rx_on_when_idle(false);
-    /* The stack starts in the commissioning path - resume, rejoin or
-     * association - so it must start on the active rate. Asserted rather than
-     * trusted: the 200 ms library default is load-bearing, and a release that
-     * changed it would otherwise break joining silently. The first probe
-     * confirm is what shifts to the idle rate. */
-    /* The long poll interval is read, not set: zed_config.keep_alive was
-     * confirmed to reach the stack intact, so the setter that proved it is
-     * gone. The read stays, because a wrong long poll interval would look
-     * identical to the fast poll defect from the outside. */
-    ezb_nwk_set_fast_poll_interval(EPSOLAR_ZIGBEE_ACTIVE_POLL_MS);
+    /* Asserted rather than trusted: the 200 ms library default is
+     * load-bearing, and a release that changed it would otherwise break
+     * joining silently. The long poll interval is read, not set:
+     * zed_config.keep_alive reaches the stack intact, and a wrong value here
+     * would look identical to the fast poll defect from the outside. */
+    ezb_nwk_set_fast_poll_interval(EPSOLAR_ZIGBEE_FAST_POLL_MS);
     ESP_LOGW(
         TAG,
-        "SED poll configuration: long poll %" PRIu32 "ms, fast poll %" PRIu32
-        "ms active, %ums idle",
+        "SED poll configuration: long poll %" PRIu32 "ms, fast poll %" PRIu32 "ms",
         ezb_nwk_get_keepalive_interval(),
-        ezb_nwk_get_fast_poll_interval(),
-        (unsigned)EPSOLAR_ZIGBEE_IDLE_POLL_MS
+        ezb_nwk_get_fast_poll_interval()
     );
     ezb_aps_secur_enable_distributed_security(false);
     ezb_nwk_set_min_join_lqi(EPSOLAR_ZIGBEE_MIN_JOIN_LQI);
