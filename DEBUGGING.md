@@ -1,5 +1,20 @@
 # Debugging the light sleep fault
 
+> **Resolved — 2026-08-07.** The fault was never in this firmware's lock
+> scheduling. Two independent failure modes were captured by the black box:
+> the 802.15.4 RX path goes permanently deaf after the first automatic light
+> sleep (runs 23/26: first cycle's probe confirms, every later confirm is
+> `0xa7` while the report window provably held the chip awake), and the chip
+> can enter its first light sleep and never exit (run 27: `cycles=1,
+> light_sleeps=0` — the counter counts exits). Espressif's tracker documents
+> the class: esp-zigbee-sdk #775/#787, and IDF's `IEEE802154_SLEEP_ENABLE` is
+> default-off citing unfinished safe power-down (IDF-7317). The fix was
+> architectural: light sleep was removed entirely and the battery regime is
+> now one telemetry cycle per **deep-sleep** wake, a full reboot each cycle,
+> as in Espressif's own battery examples. This document is kept as the record
+> of the investigation and of the black-box readout procedure, which still
+> applies.
+
 This node cannot be observed while it is failing. USB has to be unplugged before
 external power goes on, pulling external power is a power-on reset, and a
 power-on reset is the one event RTC RAM does not survive. So the firmware writes

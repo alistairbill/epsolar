@@ -10,8 +10,8 @@ controller over Modbus RTU and republishes the telemetry as a Zigbee sleepy end 
 converter — it lives here but is deployed separately to the zigbee2mqtt host.
 
 There is no test suite; verification is flash-and-observe. `DEBUGGING.md` is the
-procedure for the light-sleep fault and should be read before touching power
-management.
+historical record of the light-sleep fault that forced the current deep-sleep
+architecture; read it before considering light sleep again.
 
 ## Build and flash
 
@@ -44,27 +44,38 @@ patterns from 1.x-era Espressif examples without translating them. Header refere
 
 ## Architecture
 
-Three concurrent contexts, plus timers:
+**On battery the node lives one telemetry cycle at a time**: cold boot → resume the
+saved network → one cycle → deep sleep for the rest of
+`CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS` → repeat, exactly the shape of Espressif's own
+battery examples. This is not an optimization but a correctness requirement: on the C6
+the 802.15.4 receive path does not survive light sleep (the radio goes permanently deaf
+after the first one — see `DEBUGGING.md` and esp-zigbee-sdk #775), so the only sleep
+this firmware performs is the one a full reboot recovers from. With a USB host attached
+at boot the node instead cycles in a plain 60 s task loop with the console alive.
 
-- `app_main` — antenna select, NVS, boot diagnostics, PM config, then spawns `zigbee_main`.
+Three concurrent contexts:
+
+- `app_main` — antenna select, NVS, boot diagnostics, power-mode choice (battery mode
+  arms `awake_deadline_expired`, an `EPSOLAR_MAX_AWAKE_S` failsafe that forces deep
+  sleep if a wake wedges anywhere, stack bring-up included), then spawns `zigbee_main`.
 - `zigbee_main` (`zigbee_task`) — builds the endpoint/cluster data model, starts the
   stack, and runs `esp_zigbee_launch_mainloop()`. Signal handling and all APS confirm
-  callbacks run here.
+  callbacks run here. `ezb_nwk_set_rx_on_when_idle(false)` must run **before**
+  `esp_zigbee_start()` and never change afterwards (esp-zigbee-sdk #879: changing it on
+  a joined device silently kills the downlink).
 - `epsolar_read` (`telemetry_task`) — created only once the node has joined
-  (`on_network_joined`). One cycle per `CONFIG_EPSOLAR_UPDATE_INTERVAL_SECONDS`:
-  Modbus read → attribute writes → one link probe → link-health check → diagnostics save.
+  (`on_network_joined`). One cycle: Modbus read → attribute writes → one APS-confirmed
+  link probe → wait for its confirm (`s_probe_confirmed`, `EPSOLAR_CONFIRM_TIMEOUT_MS`)
+  → diagnostics save → deep sleep (battery) or delay-until-next-minute (USB).
 
 Data path: `modbus.c` (block descriptors, esp-modbus master) → `solar.c` (register decode
 into `epsolar_telemetry_t`, per-block `valid` bitmask) → `main.c` (`publish_telemetry`
 maps fields onto ZCL attributes).
 
 Any call touching the stack must hold `esp_zigbee_lock_acquire()`/`_release()`. The
-publish path (`set_attribute`, `set_battery_power_descriptor`)
-and `send_link_probe` deliberately take and drop the lock **per command**, with an
-`EPSOLAR_REPORT_PACING_MS` pause after each write — bursting reports under one hold
-drains the fixed out-buffer pool and starves the mainloop that would drain it, and the
-back-to-back radio burst released at the end of the hold is the sharpest supply load the
-node generates.
+publish path and `send_link_probe` take and drop the lock **per command** so the
+mainloop can transmit between writes instead of receiving the whole burst when a
+publish-wide hold ends.
 
 ## Endpoint map — keep in sync with `epsolar.mjs`
 
@@ -101,78 +112,81 @@ coordinator and `ezb_zcl_report_attr_cmd_req()` fail with `EZB_ERR_FAIL`.
 
 Report emission rides entirely on the coordinator's Configure Reporting (zigbee2mqtt asks
 for min 10 s / max 300 s with deltas of 0.1 V / 0.1 A / 1 W-or-unit): an attribute write
-only produces a report when it moves by more than the configured delta. The max-interval
-heartbeat has not been observed to fire, so static values go quiet in zigbee2mqtt; the
-link probe is the only per-cycle frame and the only heartbeat. The firmware previously
-re-armed all 15 attributes locally with a zero reportable change, which made every cycle
-emit ~15 acknowledged reports; that was removed as the prime suspect for the parent-side
-APS-ack failures (`0xa7`).
+only produces a report when it moves by more than the configured delta, so static values
+go quiet in zigbee2mqtt and the link probe is the only guaranteed per-cycle frame. The
+stack persists the coordinator's reporting configuration in `zb_storage`, which is what
+lets delta reporting keep working across the once-a-minute deep-sleep reboots; if values
+other than the probe's ever stop arriving after wakes, that persistence is the first
+assumption to check.
 
-## Link liveness and the repair ladder
+## Link liveness
 
 Nothing in the stack reports that frames stopped being delivered: `ezb_zcl_set_attr_value`
 succeeds against a dead radio, and `ezb_bdb_dev_joined()` returns true with a dead parent.
 So each cycle sends one APS-confirmed Report Attributes to the coordinator
-(`send_link_probe`), and `link_probe_confirm` is the only liveness clock.
+(`send_link_probe`) and **waits for the confirm** (`s_probe_confirmed`, bounded by
+`EPSOLAR_CONFIRM_TIMEOUT_MS`) before the cycle is allowed to end — on battery, before the
+node deep sleeps. There is no repair ladder any more: every battery wake is a cold boot
+that resumes the saved network (a failed resume escalates to BDB steering in the signal
+handler), `on_network_joined()` broadcasts one Device_annce per join so downlink routes
+never go stale, and a wake whose probe fails simply sleeps and tries again as a fresh
+boot a minute later.
 
-`arm_stall_watchdog()` is armed *before* `epsolar_modbus_init()`, not after. That retry
-loop never gives up and logs to a console nobody reads on external power, so an init that
-cannot succeed otherwise leaves the node joined, announced, online in zigbee2mqtt and
-silent indefinitely with nothing watching it. It still does not cover a node that never
-joins — the telemetry task is never created in that case.
+## Power / sleep regime
 
-`check_link_health()` escalates one step per `EPSOLAR_LINK_STALL_S` of silence:
-Device_annce (repairs the common half-dead state where a secure rejoin kept the short
-address and downlink still routes to the old parent) → rejoin via BDB network steering
-(rate-limited by `EPSOLAR_REJOIN_BACKOFF_S`) → `esp_restart()`. Separately,
-`arm_stall_watchdog()` restarts the node if telemetry cycles themselves stop.
+**Do not reintroduce light sleep.** Two independent field failure modes are on record
+(`DEBUGGING.md`): the 802.15.4 RX path goes permanently deaf after the first automatic
+light sleep (APS confirm `0xa7` forever while provably awake — runs 23/26), and the chip
+can enter its first light sleep and never exit it (run 27: `cycles=1, light_sleeps=0`).
+Espressif's own tracker documents the class (esp-zigbee-sdk #775, #787; IDF's
+`IEEE802154_SLEEP_ENABLE` is default-off citing unfinished power-down support, IDF-7317).
 
-## Power management
+The current regime:
 
-Light sleep is the fragile part; read `DEBUGGING.md` before changing anything here.
-
-- `s_startup_lock` holds `ESP_PM_NO_LIGHT_SLEEP` from the moment light sleep is armed
-  until the first telemetry cycle completes. Stack bring-up was otherwise entirely
-  unguarded — `app_main` returns as soon as `zigbee_task` is created, the report window
-  doesn't open until the first cycle, and the Modbus lock is per transaction — so the idle
-  task could sleep the chip during `esp_zigbee_init()`. There is deliberately **no failsafe
-  timeout**: a node that hasn't completed a cycle hasn't shown it survives a sleep.
-- The whole telemetry cycle is bracketed by `open_report_window()` /
-  `close_report_window()`, an `ESP_PM_NO_LIGHT_SLEEP` lock held from the Modbus read
-  until the probe's APS confirm arrives (either outcome) or
-  `EPSOLAR_REPORT_WINDOW_TIMEOUT_MS` fires. A sleepy ED fetches its APS ack via short
-  polls; sleeping through that window was the observed field failure (confirm status
-  `0xa7`).
-- `modbus.c` holds its own `ESP_PM_NO_LIGHT_SLEEP` lock per transaction — esp-modbus
-  takes none, and UART RX bytes are lost across a sleep.
-- A USB host present at boot disables light sleep for that entire run: USB Serial JTAG
-  does not survive a light sleep, so **the fault cannot reproduce over USB.**
-- `select_external_antenna()` drives and `gpio_hold_en()`s GPIO3/GPIO14 — the RF switch is
-  not exempt from the sleep GPIO isolation, so the hold is what keeps the external antenna
-  selected across sleeps.
+- Battery: one telemetry cycle per deep-sleep wake (`enter_deep_sleep()` sleeps the
+  remainder of the update interval). Every wake is a full reboot; the radio never has to
+  survive a sleep. `awake_deadline_expired` (`EPSOLAR_MAX_AWAKE_S`) forces deep sleep if
+  a wake wedges anywhere, bring-up included, so no hang can strand the node awake.
+- USB host at boot: no sleep at all, cycles run in a task loop, console stays alive.
+  **Battery-regime behaviour (reboot-per-cycle) therefore cannot be observed over USB.**
+- `select_external_antenna()` drives and `gpio_hold_en()`s GPIO3/GPIO14; each wake is a
+  boot, so the RF switch is reconfigured from scratch every cycle.
 
 ## Diagnostics black box
 
-The node cannot be observed while failing (attaching USB requires pulling external power,
-which is a power-on reset — the one event RTC RAM does not survive). So `s_diag`
-(`RTC_NOINIT_ATTR`, mirrored to the `epsolar` NVS namespace) is the channel:
+The node cannot be observed while failing in the field, so `s_diag`
+(`RTC_NOINIT_ATTR`, mirrored to the `epsolar` NVS namespace) is the channel. RTC RAM
+survives deep sleep, so on battery it stitches the once-a-minute wakes into one
+continuous run: `report_boot_diagnostics()` treats a deep-sleep wake as a continuation
+(no record rotation, no boots increment, no reset-history shift — a day of wakes must not
+scroll the cold boots out of the history), and `light_sleeps`/`light_sleep_us` now count
+deep-sleep wakes and time slept. Only a power loss zeroes RTC; NVS is what survives that.
+
 There are **two NVS records under separate keys**, and they must stay separate. The run
 record (`diag`) is written only from the cycle loop, so it always describes a run that
 produced telemetry; the boot record (`boot`) is stamped by `record_stage()` as each boot
-passes a milestone. They shared a key once, and a boot that died early overwrote the last
-good run with a `cycles=0` stub — destroying the exact snapshot the black box existed to
-capture. Every write goes through `save_diagnostics_to()`, which **refuses while a USB host
-is attached**; that freeze is the only thing protecting the evidence.
+passes a milestone — but **only on cold boots**: deep-sleep wakes stamp RTC only, or the
+once-a-minute wakes would wear out NVS. They shared a key once, and a boot that died
+early overwrote the last good run with a `cycles=0` stub. Every write goes through
+`save_diagnostics_to()`, which **refuses while a USB host is attached**; that freeze is
+the only thing protecting the evidence.
 
-`record_stage()` runs after `configure_power_management()`, never before — `light_sleep_enabled`
-is set there, and a stamp taken earlier records `light_sleep=0` for every run regardless of
+Known anomaly, unexplained: on past battery runs the NVS boot record stayed at
+`stage=1 (power configured)` even when the RTC record for the same boot reached stage 4
+and the run record was being written from the same task seconds later (runs 24 and 27).
+Treat a stage-1 boot record as "stage writes past 1 didn't stick", not as proof the boot
+died in bring-up.
+
+`record_stage()` runs after `choose_power_mode()`, never before — the regime flag is set
+there, and a stamp taken earlier records `deep_sleep=0` for every run regardless of
 regime, which is the field a readout uses to tell a USB run from a battery one.
 
 `report_boot_diagnostics()` prints **all three** sources under one boot header: a USB reset
 (reason 11 — what `idf.py monitor` performs) preserves RTC RAM, so the RTC RAM record
 describes the readout session, not the field run. Reporting only whichever source happened
 to be valid hid the field run behind the readout stub. Each record names the run it
-describes, because they are routinely different runs.
+describes, because they are routinely different runs. Boot numbers can collide across the
+USB freeze (NVS doesn't advance while frozen), so match records by content, not number.
 
 **`epsolar_diag_t`'s layout and `EPSOLAR_DIAG_MAGIC` are a wire format.** `load_diagnostics()`
 rejects on both a magic mismatch and a size mismatch, so changing either discards the

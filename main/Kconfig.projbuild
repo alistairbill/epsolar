@@ -7,37 +7,6 @@ config EPSOLAR_UPDATE_INTERVAL_SECONDS
     help
         Time between Modbus reads and Zigbee attribute updates.
 
-config EPSOLAR_REPORT_PACING_MS
-    int "Gap between report transmissions (milliseconds)"
-    range 0 1000
-    default 50
-    help
-        Pause after each attribute write during a telemetry cycle, with the
-        Zigbee stack lock released so the mainloop transmits any report the
-        write fired before the next one is queued. Zero paces nothing: the
-        cycle's frames leave the radio back to back.
-
-        The back-to-back burst is the sharpest load the node puts on its
-        supply and is fatal on a supply that sags under it; paced single
-        frames give the rail recovery time between transmissions, at the
-        cost of under a second of extra awake time per cycle. Pacing also
-        stops the publish path from draining the stack's fixed out-buffer
-        pool faster than the mainloop refills it.
-
-config EPSOLAR_LIGHT_SLEEP
-    bool "Enable automatic light sleep"
-    depends on PM_ENABLE && FREERTOS_USE_TICKLESS_IDLE
-    default y
-    help
-        Sleep between telemetry cycles. The Zigbee stack and the Modbus
-        transactions hold the chip awake whenever they need it, so this only
-        covers genuinely idle time. The firmware checks for a USB host once
-        at boot and keeps light sleep off for that whole run when one is
-        present: USB Serial JTAG does not survive a light sleep, and the USJ
-        connection monitor's own no-light-sleep lock is not reliable at
-        1000 Hz ticks. Turn this off outright to force the same no-sleep
-        reference behaviour on battery as well.
-
 config EPSOLAR_MODBUS_UART_PORT
     int "Modbus UART port"
     range 0 1

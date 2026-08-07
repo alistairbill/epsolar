@@ -6,26 +6,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_PM_ENABLE=y
-CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-# 1000 Hz broke the USJ connection monitor and did not fix the APS ack loss.
-CONFIG_FREERTOS_HZ=100
-CONFIG_IEEE802154_SLEEP_ENABLE=y
-# Bisect step 1. Powering the peripheral domain down means the UART, and every
-# other peripheral, comes back from each light sleep through register retention
-# rather than never having stopped. The Modbus transaction holds a
-# no-light-sleep lock, but epsolar_modbus_init() does not, and neither does the
-# stretch between the join and the first telemetry cycle - which is exactly
-# where the external-power runs are dying. Retention that does not fully
-# restore UART1 would leave a port that was configured before the first sleep
-# and unusable after it, with no console to say so. Costs light sleep current;
-# buys one variable removed.
-# CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP is not set
-# Powering flash down races its own wake-up: the power-down takes time, an early
-# wake re-powers the part mid-sequence, and the IDF sleep documentation says
-# plainly that it is then not guaranteed to work. ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND
-# is the supported way to get most of the saving without the race.
-# CONFIG_ESP_SLEEP_POWER_DOWN_FLASH is not set
-# Best-effort cover for a cable attached mid-run; the boot-time check is primary.
-CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
-CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+# No light sleep, deliberately: on the C6 the 802.15.4 receive path does not
+# survive it (the radio goes permanently deaf after the first sleep; run 23
+# here, esp-zigbee-sdk #775, IDF-7317). The battery regime is one telemetry
+# cycle per deep-sleep wake instead, like Espressif's own battery examples.
