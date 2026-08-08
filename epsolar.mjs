@@ -197,14 +197,19 @@ async function configureElectrical(endpoint, coordinatorEndpoint, includePower) 
         'dcVoltage',
         'dcCurrent',
     ];
+    /* Minimum interval 0 everywhere: the device is a sleepy end device that
+     * reboots for every telemetry cycle and is awake for only a few seconds,
+     * so a non-zero minimum lets the stack's reporting engine defer the report
+     * past the moment the node deep-sleeps and the report is lost. Writes only
+     * happen once per cycle anyway, so 0 cannot cause report spam. */
     const reportings = [
-        {attribute: 'dcVoltage', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 10},
-        {attribute: 'dcCurrent', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 10},
+        {attribute: 'dcVoltage', minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 10},
+        {attribute: 'dcCurrent', minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 10},
     ];
 
     if (includePower) {
         attributes.push('dcPowerMultiplier', 'dcPowerDivisor', 'dcPower');
-        reportings.push({attribute: 'dcPower', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 1});
+        reportings.push({attribute: 'dcPower', minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1});
     }
 
     await endpoint.configureReporting('haElectricalMeasurement', reportings);
@@ -214,7 +219,7 @@ async function configureElectrical(endpoint, coordinatorEndpoint, includePower) 
 async function configureAnalogInput(endpoint, coordinatorEndpoint) {
     await reporting.bind(endpoint, coordinatorEndpoint, ['genAnalogInput']);
     await endpoint.configureReporting('genAnalogInput', [
-        {attribute: 'presentValue', minimumReportInterval: 10, maximumReportInterval: 300, reportableChange: 1},
+        {attribute: 'presentValue', minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
     ]);
     await endpoint.read('genAnalogInput', ['presentValue']);
 }
@@ -267,7 +272,7 @@ const definition = {
                 throw new Error(`Missing temperature endpoint ${id}`);
             }
             await reporting.bind(endpoint, coordinatorEndpoint, ['msTemperatureMeasurement']);
-            await reporting.temperature(endpoint, {min: 10, max: 300, change: 10});
+            await reporting.temperature(endpoint, {min: 0, max: 300, change: 10});
             await endpoint.read('msTemperatureMeasurement', ['measuredValue']);
         }
 
@@ -279,7 +284,7 @@ const definition = {
         await batteryEndpoint.configureReporting('genPowerCfg', [
             {
                 attribute: 'batteryPercentageRemaining',
-                minimumReportInterval: 10,
+                minimumReportInterval: 0,
                 maximumReportInterval: 300,
                 reportableChange: 2,
             },
