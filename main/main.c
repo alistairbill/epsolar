@@ -353,6 +353,11 @@ static void report_boot_diagnostics(void)
  * cold start per cycle is the regime that never depends on it. */
 static bool s_deep_sleep_mode;
 
+/* Handle for the awake-deadline watchdog armed in choose_power_mode(). Kept
+ * at file scope, rather than local to that function, so the late USB recheck
+ * in telemetry_task()'s main loop below can stop it once it corrects course. */
+static esp_timer_handle_t s_awake_deadline;
+
 /* Sleeps whatever is left of the update interval, so wakes land on the
  * telemetry cadence rather than drifting by the awake time. Never returns. */
 static void enter_deep_sleep(void)
@@ -401,14 +406,16 @@ static void choose_power_mode(void)
         ESP_LOGW(TAG, "USB host attached at boot; cycling without deep sleep for this run");
         return;
     }
-    esp_timer_handle_t deadline;
     const esp_timer_create_args_t args = {
         .callback = awake_deadline_expired,
         .name = "epsolar_awake",
     };
-    ESP_ERROR_CHECK(esp_timer_create(&args, &deadline));
+    /* Stored in s_awake_deadline (file scope) rather than a local, so it can
+     * be stopped later if the USB recheck in telemetry_task() corrects the
+     * power-mode decision made here. */
+    ESP_ERROR_CHECK(esp_timer_create(&args, &s_awake_deadline));
     ESP_ERROR_CHECK(
-        esp_timer_start_once(deadline, (uint64_t)EPSOLAR_MAX_AWAKE_S * 1000000ULL)
+        esp_timer_start_once(s_awake_deadline, (uint64_t)EPSOLAR_MAX_AWAKE_S * 1000000ULL)
     );
 }
 
@@ -1133,6 +1140,23 @@ static void telemetry_task(void *arg)
         if (s_diag.cycles <= EPSOLAR_DIAG_DENSE_CYCLES
             || s_diag.cycles % EPSOLAR_DIAG_SAVE_CYCLES == 0) {
             save_diagnostics();
+        }
+        /* Recheck rather than trust the boot-time snapshot from
+         * choose_power_mode(): that read ran within milliseconds of power-up
+         * and can lose the race with the host still finishing USB enumeration,
+         * misreading "not connected" and sending an actually-USB-attached
+         * device into deep sleep - which then drops the mid-enumeration USB
+         * connection and forces the host to start over. By this point in the
+         * cycle, the join/telemetry work above has given enumeration plenty
+         * of time to finish, so a positive read here is trustworthy. Costs
+         * nothing on a genuine battery run - the check just reads false again
+         * - but on USB it stops the repeated drop/reconnect. */
+        if (s_deep_sleep_mode && usb_serial_jtag_is_connected()) {
+            ESP_LOGW(TAG, "USB now detected as connected; cancelling deep sleep and awake watchdog for this run");
+            s_deep_sleep_mode = false;
+            if (s_awake_deadline) {
+                esp_timer_stop(s_awake_deadline);
+            }
         }
         if (s_deep_sleep_mode) {
             enter_deep_sleep();
