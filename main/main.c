@@ -727,6 +727,63 @@ static void register_device(void)
     ESP_ERROR_CHECK(ezb_af_device_desc_register(device));
 }
 
+
+
+/* Explicit Report Attributes for whichever attribute was just set, sent
+ * unconditionally to the coordinator regardless of whatever autonomous
+ * reporting configuration might or might not have survived from a previous
+ * boot.
+ *
+ * Autonomous reporting - what Configure Reporting from the coordinator sets
+ * up, and what mark_reportable() allocates a slot for - only lasts as long
+ * as the in-memory data model it was configured against. That model is
+ * rebuilt from scratch by register_device() on every cold boot, i.e. every
+ * deep-sleep wake, so whatever the coordinator configured during the one
+ * pairing session is gone by the very next wake. Sending explicitly here,
+ * every cycle, sidesteps needing that configuration to survive at all -
+ * cluster descriptors still mark attributes reportable so Configure
+ * Reporting itself succeeds without error during interview, but nothing
+ * downstream of that first cycle actually depends on it working. */
+static void report_current_value(uint8_t endpoint, uint16_t cluster, uint16_t attribute)
+{
+    ezb_zcl_report_attr_cmd_t command = {
+        .cmd_ctrl = {
+            .dst_addr = {
+                .addr_mode = EZB_ADDR_MODE_SHORT,
+                .u = {.short_addr = 0x0000},
+            },
+            .dst_ep = 1,
+            .src_ep = endpoint,
+            .cluster_id = cluster,
+            .manuf_code = EZB_ZCL_STD_MANUF_CODE,
+            .fc = {.direction = 1, .dis_default_rsp = 1},
+            /* No cnf_ctx.cb: fire-and-forget. A dropped report is corrected
+             * by the same explicit send next cycle regardless, and waiting
+             * on a confirm per attribute here would multiply a cycle's
+             * awake-time cost many times over for no benefit worth that. */
+        },
+        .payload = {.attr_id = attribute},
+    };
+
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    ezb_err_t err = ezb_zcl_report_attr_cmd_req(&command);
+    esp_zigbee_lock_release();
+
+    if (err != EZB_ERR_NONE) {
+        ESP_LOGW(
+            TAG,
+            "Explicit report send failed: endpoint=%u cluster=0x%04x attribute=0x%04x err=0x%04x",
+            endpoint,
+            cluster,
+            attribute,
+            err
+        );
+    }
+}
+
+
+
+
 /* Let the mainloop transmit the report the last write or arm fired before the
  * next one is queued. Unpaced, the cycle's ~16 frames leave the radio back to
  * back - the sharpest load the node puts on its supply. */
@@ -747,6 +804,7 @@ static bool set_attribute(uint8_t endpoint, uint16_t cluster, uint16_t attribute
     );
     esp_zigbee_lock_release();
     if (status == EZB_ZCL_STATUS_SUCCESS) {
+        report_current_value(endpoint, cluster, attribute);
         return true;
     }
 
@@ -1351,7 +1409,13 @@ static void zigbee_task(void *arg)
             ? ESP_OK
             : ESP_FAIL
     );
-    ezb_nwk_set_rx_on_when_idle(false);
+    /* On USB, power isn't a constraint, so behave as a non-sleepy device -
+     * always listening - which sidesteps the SED poll-interval entirely and
+     * lets Z2M's interview/bind requests through immediately instead of
+     * racing the 60s long-poll window. The battery build still needs true
+     * SED behaviour: rx_on_when_idle(true) would keep the radio powered
+     * continuously and defeat the whole point of the deep sleep regime. */
+    ezb_nwk_set_rx_on_when_idle(!s_deep_sleep_mode);
     /* Asserted rather than trusted: the 200 ms library default is
      * load-bearing, and a release that changed it would otherwise break
      * joining silently. The long poll interval is read, not set:
